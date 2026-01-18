@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 
 function App() {
   const [status, setStatus] = useState("processing");
@@ -9,6 +9,7 @@ function App() {
   const [query, setQuery] = useState("");
   const [entries, setEntries] = useState([]);
   const [selectedPath, setSelectedPath] = useState("");
+  const [selectedPaths, setSelectedPaths] = useState([]);
 
   const filteredEntries = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -37,6 +38,8 @@ function App() {
     }
     return filteredEntries.findIndex((entry) => entry.path === previewEntry.path);
   }, [filteredEntries, previewEntry]);
+  const selectedPathsSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
+  const selectedCount = selectedPaths.length;
 
   const selectNext = useCallback(() => {
     if (!filteredEntries.length) {
@@ -55,6 +58,47 @@ function App() {
     const prevIndex = (index - 1 + filteredEntries.length) % filteredEntries.length;
     setSelectedPath(filteredEntries[prevIndex].path);
   }, [filteredEntries, currentIndex]);
+
+  const toggleSelection = useCallback((path) => {
+    setSelectedPaths((current) =>
+      current.includes(path) ? current.filter((item) => item !== path) : [...current, path],
+    );
+  }, []);
+
+  const selectAllFiltered = useCallback(() => {
+    if (!filteredEntries.length) {
+      return;
+    }
+    setSelectedPaths(filteredEntries.map((entry) => entry.path));
+  }, [filteredEntries]);
+
+  const clearSelection = useCallback(() => {
+    setSelectedPaths([]);
+  }, []);
+
+  const deleteSelected = useCallback(async () => {
+    if (!selectedPaths.length) {
+      return;
+    }
+    try {
+      const result = await invoke("delete_files", { paths: selectedPaths });
+      const deleted = Array.isArray(result?.deleted) ? result.deleted : [];
+      const failed = Array.isArray(result?.failed) ? result.failed : [];
+      if (deleted.length) {
+        setEntries((current) => current.filter((entry) => !deleted.includes(entry.path)));
+        setSelectedPaths((current) => current.filter((path) => !deleted.includes(path)));
+      }
+      if (failed.length) {
+        setLastError(
+          `Failed to delete ${failed.length} file${failed.length === 1 ? "" : "s"}.`,
+        );
+      } else {
+        setLastError("");
+      }
+    } catch (error) {
+      setLastError(`Failed to delete files: ${String(error)}`);
+    }
+  }, [selectedPaths]);
 
   useEffect(() => {
     let unlisten;
@@ -100,6 +144,16 @@ function App() {
         : filteredEntries[0].path,
     );
   }, [filteredEntries]);
+
+  useEffect(() => {
+    setSelectedPaths((current) =>
+      current.filter((path) => entries.some((entry) => entry.path === path)),
+    );
+  }, [entries]);
+
+  useEffect(() => {
+    setSelectedPaths([]);
+  }, [query]);
 
   useEffect(() => {
     const handleKey = (event) => {
@@ -191,12 +245,39 @@ function App() {
             <p>
               {filteredEntries.length} result{filteredEntries.length === 1 ? "" : "s"}
             </p>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               {filteredEntries.length > 0 ? (
                 <span className="normal-case tracking-normal text-slate-400">
                   {currentIndex + 1} of {filteredEntries.length}
                 </span>
               ) : null}
+              <span className="normal-case tracking-normal text-slate-500">
+                {selectedCount} selected
+              </span>
+              <button
+                type="button"
+                onClick={selectAllFiltered}
+                disabled={!filteredEntries.length}
+                className="rounded-lg border border-slate-800/80 bg-[#0b0d12] px-2 py-1 text-[11px] text-slate-200 transition enabled:hover:border-slate-600/80 enabled:hover:text-slate-100 disabled:opacity-40"
+              >
+                Select all
+              </button>
+              <button
+                type="button"
+                onClick={clearSelection}
+                disabled={!selectedCount}
+                className="rounded-lg border border-slate-800/80 bg-[#0b0d12] px-2 py-1 text-[11px] text-slate-200 transition enabled:hover:border-slate-600/80 enabled:hover:text-slate-100 disabled:opacity-40"
+              >
+                Clear
+              </button>
+              <button
+                type="button"
+                onClick={deleteSelected}
+                disabled={!selectedCount}
+                className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-[11px] text-rose-200 transition enabled:hover:border-rose-400/70 enabled:hover:text-rose-100 disabled:opacity-40"
+              >
+                Delete
+              </button>
               <button
                 type="button"
                 onClick={selectPrevious}
@@ -222,17 +303,41 @@ function App() {
               </div>
             ) : (
               <div className="grid max-h-112 grid-cols-1 gap-3 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">
-                {filteredEntries.map((entry) => (
-                  <button
+                {filteredEntries.map((entry) => {
+                  const isSelected = selectedPathsSet.has(entry.path);
+                  return (
+                  <div
                     key={entry.path}
-                    type="button"
-                    className={`group rounded-2xl border text-left transition ${
+                    className={`group relative rounded-2xl border text-left transition ${
                       entry.path === previewEntry?.path
                         ? "border-emerald-500/60 bg-emerald-500/10"
                         : "border-slate-800/80 bg-[#0b0d12] hover:border-slate-600/80 hover:bg-[#0d1016]"
                     }`}
                     onClick={() => setSelectedPath(entry.path)}
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        setSelectedPath(entry.path);
+                      }
+                    }}
                   >
+                    <button
+                      type="button"
+                      aria-pressed={isSelected}
+                      aria-label={isSelected ? "Deselect screenshot" : "Select screenshot"}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        toggleSelection(entry.path);
+                      }}
+                      className="absolute right-3 top-3 z-10 flex h-6 w-6 items-center justify-center rounded-full border border-slate-700/80 bg-[#0b0d12]/80 transition hover:border-emerald-400/70"
+                    >
+                      <span
+                        className={`h-3 w-3 rounded-full transition ${
+                          isSelected ? "bg-emerald-400" : "bg-transparent"
+                        }`}
+                      />
+                    </button>
                     <div className="rounded-2xl bg-[#11141b]">
                       <img
                         src={convertFileSrc(entry.path)}
@@ -246,8 +351,9 @@ function App() {
                         Indexed {new Date(entry.at).toLocaleString()}
                       </p>
                     </div>
-                  </button>
-                ))}
+                  </div>
+                );
+                })}
               </div>
             )}
           </div>

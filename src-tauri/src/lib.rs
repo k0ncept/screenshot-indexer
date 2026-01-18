@@ -19,6 +19,12 @@ struct OcrStatus {
     text: Option<String>,
 }
 
+#[derive(Serialize)]
+struct DeleteResult {
+    deleted: Vec<String>,
+    failed: Vec<String>,
+}
+
 fn emit_status(
     app: &AppHandle,
     status: &str,
@@ -372,10 +378,59 @@ fn start_watcher(app: AppHandle) {
     });
 }
 
+#[tauri::command]
+fn delete_files(paths: Vec<String>) -> Result<DeleteResult, String> {
+    if paths.is_empty() {
+        return Err("No files selected for deletion".to_string());
+    }
+
+    let watch_dirs = resolve_watch_dirs();
+    if watch_dirs.is_empty() {
+        return Err("Watch directories not available".to_string());
+    }
+
+    let mut deleted = Vec::new();
+    let mut failed = Vec::new();
+
+    for path_str in paths {
+        let path = PathBuf::from(&path_str);
+        let Ok(canonical_path) = fs::canonicalize(&path) else {
+            failed.push(path_str);
+            continue;
+        };
+
+        let allowed = watch_dirs.iter().any(|dir| {
+            fs::canonicalize(dir)
+                .map(|canonical_dir| canonical_path.starts_with(&canonical_dir))
+                .unwrap_or(false)
+        });
+
+        if !allowed {
+            failed.push(path_str);
+            continue;
+        }
+
+        match fs::remove_file(&canonical_path) {
+            Ok(_) => {
+                deleted.push(
+                    canonical_path
+                        .to_str()
+                        .unwrap_or(&path_str)
+                        .to_string(),
+                );
+            }
+            Err(_) => failed.push(path_str),
+        }
+    }
+
+    Ok(DeleteResult { deleted, failed })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![delete_files])
         .setup(|app| {
             start_watcher(app.handle().clone());
             Ok(())
