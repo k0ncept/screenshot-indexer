@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc } from "@tauri-apps/api/core";
 
@@ -31,8 +31,30 @@ function App() {
     }
     return filteredEntries.find((entry) => entry.path === selectedPath) ?? filteredEntries[0];
   }, [filteredEntries, selectedPath]);
+  const currentIndex = useMemo(() => {
+    if (!filteredEntries.length || !previewEntry) {
+      return -1;
+    }
+    return filteredEntries.findIndex((entry) => entry.path === previewEntry.path);
+  }, [filteredEntries, previewEntry]);
 
-  const previewSrc = previewEntry ? convertFileSrc(previewEntry.path) : "";
+  const selectNext = useCallback(() => {
+    if (!filteredEntries.length) {
+      return;
+    }
+    const index = currentIndex >= 0 ? currentIndex : 0;
+    const nextIndex = (index + 1) % filteredEntries.length;
+    setSelectedPath(filteredEntries[nextIndex].path);
+  }, [filteredEntries, currentIndex]);
+
+  const selectPrevious = useCallback(() => {
+    if (!filteredEntries.length) {
+      return;
+    }
+    const index = currentIndex >= 0 ? currentIndex : 0;
+    const prevIndex = (index - 1 + filteredEntries.length) % filteredEntries.length;
+    setSelectedPath(filteredEntries[prevIndex].path);
+  }, [filteredEntries, currentIndex]);
 
   useEffect(() => {
     let unlisten;
@@ -79,13 +101,43 @@ function App() {
     );
   }, [filteredEntries]);
 
+  useEffect(() => {
+    const handleKey = (event) => {
+      const target = event.target;
+      const isEditable =
+        target instanceof HTMLElement &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable);
+      if (isEditable) {
+        return;
+      }
+
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+        event.preventDefault();
+        selectNext();
+      }
+      if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+        event.preventDefault();
+        selectPrevious();
+      }
+    };
+
+    window.addEventListener("keydown", handleKey);
+    return () => {
+      window.removeEventListener("keydown", handleKey);
+    };
+  }, [selectNext, selectPrevious]);
+
   return (
-    <main className="flex min-h-full items-center justify-center bg-slate-950 text-slate-100">
-      <div className="w-full max-w-xl rounded-2xl border border-slate-800 bg-slate-900/60 p-8 shadow-xl">
-        <div className="flex items-center gap-3">
-          <div className="h-3 w-3 animate-pulse rounded-full bg-emerald-400" />
-          <h1 className="text-xl font-semibold">Screenshot OCR</h1>
-        </div>
+    <main className="flex min-h-full items-center justify-center bg-[#0a0b0f] text-slate-100">
+      <div className="relative w-full max-w-2xl overflow-hidden rounded-3xl border border-slate-800/70 bg-[#0d1016] shadow-[0_20px_80px_rgba(0,0,0,0.6)]">
+        <div className="pointer-events-none absolute inset-0 bg-linear-to-br from-slate-900/40 via-transparent to-slate-950/80" />
+        <div className="relative p-8">
+          <div className="flex items-center gap-3">
+            <div className="h-2.5 w-2.5 animate-pulse rounded-full bg-emerald-400" />
+            <h1 className="text-lg font-semibold text-slate-200">Screenshot OCR</h1>
+          </div>
 
         <p className="mt-6 text-3xl font-semibold">
           {status === "processing" ? "Processing..." : "Idle"}
@@ -109,76 +161,97 @@ function App() {
         </div>
 
         <div className="mt-8">
-          <label className="text-sm font-medium text-slate-200" htmlFor="search">
-            Search indexed text
+          <label className="text-xs font-medium uppercase tracking-[0.2em] text-slate-500" htmlFor="search">
+            Search
           </label>
-          <input
-            id="search"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Type to filter results..."
-            className="mt-2 w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/60"
-          />
+          <div className="mt-3 flex items-center gap-3 rounded-2xl border border-slate-800/80 bg-[#0b0d12] px-4 py-3 text-sm text-slate-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.05),0_10px_30px_rgba(0,0,0,0.5)] focus-within:border-emerald-500/60 focus-within:ring-2 focus-within:ring-emerald-500/20">
+            <svg
+              aria-hidden="true"
+              viewBox="0 0 24 24"
+              className="h-4 w-4 text-slate-500"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+            >
+              <circle cx="11" cy="11" r="7" />
+              <path d="M16.5 16.5 21 21" />
+            </svg>
+            <input
+              id="search"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search screenshots..."
+              className="w-full bg-transparent text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none"
+            />
+          </div>
         </div>
 
         <div className="mt-6">
-          <p className="text-sm text-slate-400">
-            {filteredEntries.length} result{filteredEntries.length === 1 ? "" : "s"}
-          </p>
-          <div className="mt-3 grid gap-4 md:grid-cols-[1.2fr_1fr]">
-            <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3">
-              {previewEntry ? (
-                <>
-                  <p className="truncate text-xs text-slate-400">{previewEntry.path}</p>
-                  <div className="mt-3 flex items-center justify-center rounded-lg border border-slate-800 bg-slate-900/40 p-3">
-                    <img
-                      src={previewSrc}
-                      alt="Screenshot preview"
-                      className="max-h-64 w-full object-contain"
-                    />
-                  </div>
-                </>
-              ) : (
-                <div className="flex min-h-[12rem] items-center justify-center text-sm text-slate-500">
-                  No screenshot selected.
-                </div>
-              )}
+          <div className="flex flex-wrap items-center justify-between gap-3 text-xs uppercase tracking-[0.2em] text-slate-500">
+            <p>
+              {filteredEntries.length} result{filteredEntries.length === 1 ? "" : "s"}
+            </p>
+            <div className="flex items-center gap-2">
+              {filteredEntries.length > 0 ? (
+                <span className="normal-case tracking-normal text-slate-400">
+                  {currentIndex + 1} of {filteredEntries.length}
+                </span>
+              ) : null}
+              <button
+                type="button"
+                onClick={selectPrevious}
+                disabled={!filteredEntries.length}
+                className="rounded-lg border border-slate-800/80 bg-[#0b0d12] px-2 py-1 text-[11px] text-slate-200 transition enabled:hover:border-slate-600/80 enabled:hover:text-slate-100 disabled:opacity-40"
+              >
+                Prev
+              </button>
+              <button
+                type="button"
+                onClick={selectNext}
+                disabled={!filteredEntries.length}
+                className="rounded-lg border border-slate-800/80 bg-[#0b0d12] px-2 py-1 text-[11px] text-slate-200 transition enabled:hover:border-slate-600/80 enabled:hover:text-slate-100 disabled:opacity-40"
+              >
+                Next
+              </button>
             </div>
-            <div className="max-h-64 space-y-3 overflow-y-auto pr-1">
+          </div>
+          <div className="mt-4">
             {filteredEntries.length === 0 ? (
-              <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-4 text-sm text-slate-500">
+              <div className="rounded-2xl border border-slate-800/70 bg-[#0b0d12] px-3 py-6 text-center text-sm text-slate-500">
                 No matches yet.
               </div>
             ) : (
-              filteredEntries.map((entry) => (
-                <div
-                  key={entry.path}
-                  className={`cursor-pointer rounded-lg border px-3 py-3 text-sm transition ${
-                    entry.path === previewEntry?.path
-                      ? "border-emerald-500/60 bg-emerald-500/10"
-                      : "border-slate-800 bg-slate-950/60 hover:border-slate-700"
-                  }`}
-                  onClick={() => setSelectedPath(entry.path)}
-                  role="button"
-                  tabIndex={0}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") {
-                      setSelectedPath(entry.path);
-                    }
-                  }}
-                >
-                  <p className="truncate font-medium text-slate-200">{entry.path}</p>
-                  <p className="mt-2 whitespace-pre-wrap text-slate-300">
-                    {entry.text}
-                  </p>
-                  <p className="mt-2 text-xs text-slate-500">
-                    Indexed {new Date(entry.at).toLocaleString()}
-                  </p>
-                </div>
-              ))
+              <div className="grid max-h-112 grid-cols-1 gap-3 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">
+                {filteredEntries.map((entry) => (
+                  <button
+                    key={entry.path}
+                    type="button"
+                    className={`group rounded-2xl border text-left transition ${
+                      entry.path === previewEntry?.path
+                        ? "border-emerald-500/60 bg-emerald-500/10"
+                        : "border-slate-800/80 bg-[#0b0d12] hover:border-slate-600/80 hover:bg-[#0d1016]"
+                    }`}
+                    onClick={() => setSelectedPath(entry.path)}
+                  >
+                    <div className="rounded-2xl bg-[#11141b]">
+                      <img
+                        src={convertFileSrc(entry.path)}
+                        alt="Screenshot preview"
+                        className="h-40 w-full rounded-2xl object-cover"
+                      />
+                    </div>
+                    <div className="px-3 pb-3 pt-2">
+                      <p className="truncate text-xs text-slate-300">{entry.path}</p>
+                      <p className="mt-1 text-[11px] text-slate-500">
+                        Indexed {new Date(entry.at).toLocaleString()}
+                      </p>
+                    </div>
+                  </button>
+                ))}
+              </div>
             )}
-            </div>
           </div>
+        </div>
         </div>
       </div>
     </main>

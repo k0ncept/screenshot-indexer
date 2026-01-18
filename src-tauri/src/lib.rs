@@ -1,7 +1,7 @@
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{mpsc, Arc, Mutex},
@@ -98,6 +98,40 @@ fn run_ocr(path: &Path) -> Result<String, String> {
         .map_err(|error| format!("{error}"))
 }
 
+fn summarize_text(text: &str) -> String {
+    let mut best_line = "";
+    let mut best_score = 0usize;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let score = trimmed.chars().filter(|ch| ch.is_ascii_alphanumeric()).count();
+        if score > best_score {
+            best_score = score;
+            best_line = trimmed;
+        }
+    }
+
+    let source = if best_line.is_empty() { text } else { best_line };
+    let mut words = Vec::new();
+    for word in source.split_whitespace() {
+        let cleaned = word
+            .trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
+            .to_ascii_lowercase();
+        if cleaned.len() < 3 {
+            continue;
+        }
+        words.push(cleaned);
+        if words.len() >= 5 {
+            break;
+        }
+    }
+
+    words.join(" ")
+}
+
 fn slugify_text(text: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
@@ -132,7 +166,8 @@ fn rename_with_text(path: &Path, text: &str) -> Result<PathBuf, String> {
     let parent = path
         .parent()
         .ok_or_else(|| "Screenshot path missing parent directory".to_string())?;
-    let slug = slugify_text(text);
+    let summary = summarize_text(text);
+    let slug = slugify_text(&summary);
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| format!("{error}"))?
@@ -161,6 +196,7 @@ fn process_screenshot(
     app: AppHandle,
     path: PathBuf,
     ignore_map: Arc<Mutex<HashMap<PathBuf, Instant>>>,
+    known_map: Arc<Mutex<HashSet<PathBuf>>>,
 ) {
     emit_status(&app, "processing", Some(&path), None, None);
 
@@ -181,6 +217,10 @@ fn process_screenshot(
                 }
             };
             remember_ignore(&ignore_map, &final_path);
+            {
+                let mut guard = known_map.lock().unwrap();
+                guard.insert(final_path.clone());
+            }
             println!("OCR result for {}:\n{}", final_path.display(), trimmed);
             emit_status(&app, "idle", Some(&final_path), None, Some(trimmed));
         }
@@ -196,13 +236,26 @@ fn handle_event(
     event: Event,
     debounce_map: &Arc<Mutex<HashMap<PathBuf, Instant>>>,
     ignore_map: &Arc<Mutex<HashMap<PathBuf, Instant>>>,
+    known_map: &Arc<Mutex<HashSet<PathBuf>>>,
 ) {
     if !matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
         return;
     }
 
     for path in event.paths {
-        if is_png(&path) && !is_hidden(&path) && !is_ignored(ignore_map, &path) {
+        if !is_png(&path) || is_hidden(&path) || is_ignored(ignore_map, &path) {
+            continue;
+        }
+
+        let already_known = {
+            let guard = known_map.lock().unwrap();
+            guard.contains(&path)
+        };
+        if already_known {
+            continue;
+        }
+
+        if !is_ignored(ignore_map, &path) {
             let now = Instant::now();
             {
                 let mut guard = debounce_map.lock().unwrap();
@@ -212,6 +265,7 @@ fn handle_event(
             let app_handle = app.clone();
             let debounce_map = Arc::clone(debounce_map);
             let ignore_map = Arc::clone(ignore_map);
+            let known_map = Arc::clone(known_map);
             tauri::async_runtime::spawn_blocking(move || {
                 thread::sleep(Duration::from_millis(750));
                 let should_process = {
@@ -220,11 +274,54 @@ fn handle_event(
                 };
 
                 if should_process {
-                    process_screenshot(app_handle, path, ignore_map);
+                    process_screenshot(app_handle, path, ignore_map, known_map);
                 }
             });
         }
     }
+}
+
+fn load_existing_screenshots(watch_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut existing = Vec::new();
+
+    for dir in watch_dirs {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_png(&path) && !is_hidden(&path) {
+                existing.push(path);
+            }
+        }
+    }
+
+    existing
+}
+
+fn process_existing_screenshots(app: AppHandle, paths: Vec<PathBuf>) {
+    tauri::async_runtime::spawn_blocking(move || {
+        for path in paths {
+            emit_status(&app, "processing", Some(&path), None, None);
+            if let Err(error) = wait_for_file(&path) {
+                eprintln!("File not ready: {} ({error})", path.display());
+                emit_status(&app, "idle", Some(&path), Some(error), None);
+                continue;
+            }
+
+            match run_ocr(&path) {
+                Ok(text) => {
+                    let trimmed = text.trim().to_string();
+                    println!("OCR result for {}:\n{}", path.display(), trimmed);
+                    emit_status(&app, "idle", Some(&path), None, Some(trimmed));
+                }
+                Err(error) => {
+                    eprintln!("OCR failed for {}: {error}", path.display());
+                    emit_status(&app, "idle", Some(&path), Some(error), None);
+                }
+            }
+        }
+    });
 }
 
 fn start_watcher(app: AppHandle) {
@@ -232,6 +329,7 @@ fn start_watcher(app: AppHandle) {
         let (tx, rx) = mpsc::channel();
         let debounce_map = Arc::new(Mutex::new(HashMap::new()));
         let ignore_map = Arc::new(Mutex::new(HashMap::new()));
+        let known_map = Arc::new(Mutex::new(HashSet::new()));
 
         let mut watcher = match notify::recommended_watcher(move |res| {
             let _ = tx.send(res);
@@ -248,6 +346,15 @@ fn start_watcher(app: AppHandle) {
             return;
         }
 
+        let existing = load_existing_screenshots(&watch_dirs);
+        {
+            let mut guard = known_map.lock().unwrap();
+            for path in &existing {
+                guard.insert(path.clone());
+            }
+        }
+        process_existing_screenshots(app.clone(), existing);
+
         for dir in watch_dirs {
             if let Err(error) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
                 eprintln!("Failed to watch {}: {error}", dir.display());
@@ -258,7 +365,7 @@ fn start_watcher(app: AppHandle) {
 
         for res in rx {
             match res {
-                Ok(event) => handle_event(&app, event, &debounce_map, &ignore_map),
+                Ok(event) => handle_event(&app, event, &debounce_map, &ignore_map, &known_map),
                 Err(error) => eprintln!("Watch error: {error}"),
             }
         }
