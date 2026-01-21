@@ -1,4 +1,5 @@
 use notify::{Event, EventKind, RecursiveMode, Watcher};
+use rusqlite::{Connection, Result as SqlResult};
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -8,8 +9,10 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tesseract::Tesseract;
+use image::{ImageBuffer, GenericImageView};
+use regex::Regex;
 
 #[derive(Clone, Serialize)]
 struct OcrStatus {
@@ -136,32 +139,782 @@ fn wait_for_file(path: &Path) -> Result<(), String> {
     Err("File not ready after waiting".to_string())
 }
 
+fn preprocess_image(path: &Path) -> Result<PathBuf, String> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| "Image path is not valid UTF-8".to_string())?;
+    
+    println!("[OCR] Preprocessing image: {}", path_str);
+    
+    // Load the image
+    let img = image::open(path)
+        .map_err(|e| format!("Failed to open image: {e}"))?;
+    
+    let (width, height) = img.dimensions();
+    println!("[OCR] Original image size: {}x{}", width, height);
+    
+    // Convert to grayscale
+    let gray_img = img.to_luma8();
+    
+    // Create a new grayscale image buffer for processed image
+    let mut processed = ImageBuffer::new(width, height);
+    
+    // Apply lighter preprocessing for messaging apps
+    // Less aggressive than before - just slight contrast enhancement
+    for (x, y, pixel) in gray_img.enumerate_pixels() {
+        let gray = pixel[0];
+        
+        // Light contrast enhancement (less aggressive for chat bubbles)
+        let enhanced = if gray < 100 {
+            // Darken dark areas slightly
+            ((gray as f64 * 0.9).max(0.0)) as u8
+        } else if gray > 155 {
+            // Lighten light areas slightly
+            (((gray as f64 - 155.0) * 1.1 + 155.0).min(255.0)) as u8
+        } else {
+            gray // Keep middle tones as-is
+        };
+        
+        processed.put_pixel(x, y, image::Luma([enhanced]));
+    }
+    
+    // Save processed image to temp file
+    let temp_path = path.parent()
+        .ok_or_else(|| "No parent directory".to_string())?
+        .join(format!(".ocr_temp_{}.png", 
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()));
+    
+    processed.save(&temp_path)
+        .map_err(|e| format!("Failed to save processed image: {e}"))?;
+    
+    println!("[OCR] Preprocessed image saved to: {:?}", temp_path);
+    Ok(temp_path)
+}
+
+fn run_ocr_with_psm(path: &Path, psm_mode: &str, description: &str) -> Result<String, String> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| "Image path is not valid UTF-8".to_string())?;
+    
+    println!("[OCR] Attempting OCR with PSM {} ({})", psm_mode, description);
+    
+    // Build Tesseract with enhanced configuration for messaging apps
+    let tesseract = Tesseract::new(None, Some("eng"))
+        .map_err(|error| format!("Tesseract initialization failed: {error}"))?;
+    
+    // Enhanced configuration for better UI/messaging text recognition
+    let tesseract = match tesseract.set_variable("tessedit_pageseg_mode", psm_mode) {
+        Ok(t) => {
+            // Try to set multiple optimization variables
+            let mut configured = t;
+            
+            // Set OEM to LSTM for better accuracy
+            configured = match configured.set_variable("oem", "1") {
+                Ok(c) => c,
+                Err(_) => {
+                    // If OEM fails, recreate with just PSM
+                    Tesseract::new(None, Some("eng"))
+                        .map_err(|error| format!("Tesseract initialization failed: {error}"))?
+                        .set_variable("tessedit_pageseg_mode", psm_mode)
+                        .unwrap_or_else(|_| {
+                            Tesseract::new(None, Some("eng"))
+                                .expect("Tesseract should work")
+                        })
+                }
+            };
+            
+            // Try additional optimizations for UI text
+            // Since set_variable consumes self, we chain them and recreate from scratch if any fails
+            // Helper to recreate base Tesseract with essential settings
+            let recreate_base = || -> Tesseract {
+                Tesseract::new(None, Some("eng"))
+                    .map_err(|_| "Failed".to_string())
+                    .ok()
+                    .and_then(|t| t.set_variable("tessedit_pageseg_mode", psm_mode).ok())
+                    .and_then(|t| t.set_variable("oem", "1").ok())
+                    .unwrap_or_else(|| {
+                        // Last resort: just PSM
+                        Tesseract::new(None, Some("eng"))
+                            .expect("Tesseract should work")
+                            .set_variable("tessedit_pageseg_mode", psm_mode)
+                            .unwrap_or_else(|_| {
+                                Tesseract::new(None, Some("eng"))
+                                    .expect("Tesseract should work")
+                            })
+                    })
+            };
+            
+            // Chain variable settings - if any fails, recreate base and continue
+            let final_config = configured
+                .set_variable("preserve_interword_spaces", "1")
+                .unwrap_or_else(|_| recreate_base())
+                .set_variable("load_system_dawg", "0")
+                .unwrap_or_else(|_| recreate_base())
+                .set_variable("load_freq_dawg", "0")
+                .unwrap_or_else(|_| recreate_base())
+                .set_variable("load_unambig_dawg", "0")
+                .unwrap_or_else(|_| recreate_base())
+                .set_variable("load_punc_dawg", "0")
+                .unwrap_or_else(|_| recreate_base())
+                .set_variable("load_number_dawg", "0")
+                .unwrap_or_else(|_| recreate_base());
+            
+            // Note: We don't set a character whitelist because:
+            // 1. Messages can contain emojis, special characters, etc.
+            // 2. Whitelist can hurt OCR accuracy by restricting what Tesseract can recognize
+            // 3. We'll clean the text post-OCR instead
+            
+            final_config
+        }
+        Err(e) => {
+            println!("[OCR] Warning: Failed to set PSM {}: {:?}, using defaults", psm_mode, e);
+            // Recreate if setting failed
+            let base = Tesseract::new(None, Some("eng"))
+                .map_err(|error| format!("Tesseract initialization failed: {error}"))?;
+            // Try OEM on the base
+            match base.set_variable("oem", "1") {
+                Ok(configured) => configured,
+                Err(_) => {
+                    // Recreate since base was moved
+                    Tesseract::new(None, Some("eng"))
+                        .map_err(|error| format!("Tesseract initialization failed: {error}"))?
+                }
+            }
+        }
+    };
+    
+    // Run OCR
+    let result = tesseract
+        .set_image(path_str)
+        .map_err(|error| format!("Failed to set image: {error}"))?
+        .get_text()
+        .map_err(|error| format!("OCR extraction failed: {error}"))?;
+    
+    let cleaned = result
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    
+    let char_count = cleaned.len();
+    println!("[OCR] PSM {} extracted {} characters", psm_mode, char_count);
+    
+    Ok(cleaned)
+}
+
+fn fix_ocr_character_mistakes(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    
+    let mut fixed = text.to_string();
+    
+    // Common OCR mistakes: fix character misreadings
+    // OCR often confuses "I" (capital i) with "l" (lowercase L)
+    // This is especially common in lowercase words like "lmao" -> "Imao"
+    
+    // Fix specific common words FIRST (before general pattern)
+    // "Imfa" -> "lmfa" (laughing my fucking ass) - do this first
+    fixed = fixed.replace("Imfaooo0o", "lmfao");
+    fixed = fixed.replace("Imfaoooo", "lmfao");
+    fixed = fixed.replace("Imfaooo", "lmfao");
+    fixed = fixed.replace("Imfaoo", "lmfao");
+    fixed = fixed.replace("Imfao", "lmfao");
+    fixed = fixed.replace("Imfa", "lmfa");
+    
+    // "Imao" -> "lmao" (laughing my ass off)
+    fixed = fixed.replace("Imaoooo", "lmao");
+    fixed = fixed.replace("Imaooo", "lmao");
+    fixed = fixed.replace("Imaoo", "lmao");
+    fixed = fixed.replace("Imao", "lmao");
+    fixed = fixed.replace("imao", "lmao");
+    fixed = fixed.replace("iMAO", "lmao");
+    fixed = fixed.replace("ImAO", "lmao");
+    
+    // "Iol" -> "Lol" (laughing out loud)
+    fixed = fixed.replace("IOl", "Lol");
+    fixed = fixed.replace("IOI", "Lol");
+    fixed = fixed.replace("ioI", "Lol");
+    fixed = fixed.replace("Iol", "Lol");
+    
+    // Then fix general patterns where "I" at start of word should be "l"
+    // Pattern: "I" followed by lowercase letters (likely "l" in lowercase word)
+    let i_to_l_pattern = Regex::new(r"\bI([a-z]{2,})\b").unwrap();
+    fixed = i_to_l_pattern.replace_all(&fixed, |caps: &regex::Captures| {
+        format!("l{}", &caps[1])
+    }).to_string();
+    
+    // "Iol" -> "Lol" (laughing out loud)
+    fixed = fixed.replace("Iol", "Lol");
+    fixed = fixed.replace("ioI", "Lol");
+    fixed = fixed.replace("IOI", "Lol");
+    fixed = fixed.replace("IOl", "Lol");
+    
+    // Fix "0" -> "o" in word contexts (but keep "0" in numbers)
+    // Only replace "0" when it's clearly in a word (surrounded by letters)
+    let zero_in_word = Regex::new(r"([a-zA-Z])0+([a-zA-Z])").unwrap();
+    fixed = zero_in_word.replace_all(&fixed, |caps: &regex::Captures| {
+        // Replace multiple zeros with single "o"
+        format!("{}o{}", &caps[1], &caps[2])
+    }).to_string();
+    
+    // Fix "5" -> "s" in word contexts
+    let five_in_word = Regex::new(r"([a-zA-Z])5([a-zA-Z])").unwrap();
+    fixed = five_in_word.replace_all(&fixed, |caps: &regex::Captures| {
+        format!("{}s{}", &caps[1], &caps[2])
+    }).to_string();
+    
+    // Fix "1" -> "l" or "i" in word contexts (but keep "1" in numbers)
+    let one_in_word = Regex::new(r"([a-zA-Z])1([a-zA-Z])").unwrap();
+    fixed = one_in_word.replace_all(&fixed, |caps: &regex::Captures| {
+        format!("{}l{}", &caps[1], &caps[2])
+    }).to_string();
+    
+    fixed
+}
+
+fn clean_ocr_text(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    
+    // First fix common OCR character mistakes
+    let text = fix_ocr_character_mistakes(text);
+    
+    // Store original (after character fixes) for safety checks
+    let original_text = text.to_string();
+    let original_len = text.len();
+    let mut cleaned = text.to_string();
+    
+    // Remove timestamp patterns (e.g., "6:19 PM", "9:47 PM", "11:45 AM", "6:19", "09:47")
+    // Use word boundaries to ensure we only match timestamps, not words containing numbers
+    let timestamp_pattern = Regex::new(r"\b\d{1,2}:\d{2}(?:\s*(?:AM|PM|am|pm))?\b").unwrap();
+    cleaned = timestamp_pattern.replace_all(&cleaned, " ").to_string(); // Replace with space, not empty string
+    
+    // Remove date + time patterns (e.g., "Jan 20 at 7:28 PM", "Jan 13 11:08:08 AM")
+    let date_time_pattern = Regex::new(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}(?:\s+at\s+)?\d{1,2}:\d{2}(:\d{2})?(?:\s*(?:AM|PM|am|pm))?\b").unwrap();
+    cleaned = date_time_pattern.replace_all(&cleaned, "").to_string();
+    
+    // Remove "Just now", "Today", "Yesterday", "moments ago", etc.
+    let relative_time_pattern = Regex::new(r"\b(Just now|Today|Yesterday|This Week|This Month|moments? ago|\d+[smhd]\s+ago)\b").unwrap();
+    cleaned = relative_time_pattern.replace_all(&cleaned, "").to_string();
+    
+    // Remove common UI elements (case insensitive)
+    let ui_pattern = Regex::new(r"(?i)\b(Select all|Clear|Delete|Next|Prev|indexed|selected|RESULTS|result|of|Last:|Chronicle)\b").unwrap();
+    cleaned = ui_pattern.replace_all(&cleaned, "").to_string();
+    
+    // Remove read receipts and status indicators
+    let status_pattern = Regex::new(r"(?i)\b(Read|Delivered|Sending|Sent|✓|✔|✗|×|checkmark|read receipt)\b").unwrap();
+    cleaned = status_pattern.replace_all(&cleaned, "").to_string();
+    
+    // Remove common messaging app UI elements
+    let messaging_ui = Regex::new(r"(?i)\b(Search|Type a message|Send|Reply|Forward|Copy|Share|More|Options|Menu|Settings|Profile|Channel|DM|Direct Message|Group|Thread)\b").unwrap();
+    cleaned = messaging_ui.replace_all(&cleaned, "").to_string();
+    
+    // Remove standalone time patterns like "1m", "5m", "2h" (message timestamps)
+    let short_time = Regex::new(r"\b\d{1,2}[smhd]\b").unwrap();
+    cleaned = short_time.replace_all(&cleaned, "").to_string();
+    
+    // Remove excessive whitespace and newlines
+    // First, replace multiple newlines with single space
+    let newline_pattern = Regex::new(r"\n\s*\n+").unwrap();
+    cleaned = newline_pattern.replace_all(&cleaned, " ").to_string();
+    
+    // Replace multiple spaces with single space
+    let space_pattern = Regex::new(r"\s+").unwrap();
+    cleaned = space_pattern.replace_all(&cleaned, " ").to_string();
+    
+    // Remove leading/trailing whitespace
+    cleaned = cleaned.trim().to_string();
+    
+    // Don't remove single character words - they might be important in messages
+    // (e.g., "I", "a", "u" for "you", etc.)
+    // Only remove if the entire text is mostly single characters (likely noise)
+    
+    // Count meaningful vs noise words
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    let meaningful_count = words.iter().filter(|w| w.len() >= 2).count();
+    let total_count = words.len();
+    
+    // Only filter single chars if they're the majority (likely OCR noise)
+    if total_count > 0 && meaningful_count < total_count / 2 {
+        // Too much noise, filter single chars
+        let meaningful_words: Vec<&str> = words
+            .iter()
+            .filter(|word| {
+                let w = word.trim();
+                w.len() >= 2 || w.parse::<u32>().is_ok()
+            })
+            .copied()
+            .collect();
+        cleaned = meaningful_words.join(" ");
+    }
+    
+    // Remove excessive isolated punctuation (but keep emojis and common punctuation)
+    let isolated_punct = Regex::new(r"\s+[^\w\s]{3,}\s+").unwrap(); // Only remove 3+ char sequences
+    cleaned = isolated_punct.replace_all(&cleaned, " ").to_string();
+    
+    // Final trim
+    let final_cleaned = cleaned.trim().to_string();
+    
+    // Log cleaning results if significant cleaning occurred
+    if original_len > 0 && final_cleaned.len() < original_len {
+        let removed = original_len - final_cleaned.len();
+        let percent_removed = (removed as f64 / original_len as f64) * 100.0;
+        if percent_removed > 10.0 {
+            println!("[CLEAN] Removed {} chars ({:.1}%) of noise/timestamps/UI elements", removed, percent_removed);
+            if original_len < 200 {
+                println!("[CLEAN] Before: {}", text);
+                println!("[CLEAN] After:  {}", final_cleaned);
+            } else {
+                println!("[CLEAN] Before: {}...", text.chars().take(100).collect::<String>());
+                println!("[CLEAN] After:  {}...", final_cleaned.chars().take(100).collect::<String>());
+            }
+        }
+    }
+    
+    // SAFETY CHECK 1: Don't remove more than 70% of content
+    if !final_cleaned.is_empty() && final_cleaned.len() < (original_len as f64 * 0.3) as usize {
+        let percent_removed = (1.0 - (final_cleaned.len() as f64 / original_len as f64)) * 100.0;
+        println!("[CLEAN] ⚠️ Cleaning too aggressive ({:.1}% removed), using original text", percent_removed);
+        return original_text;
+    }
+    
+    // SAFETY CHECK 2: Make sure we still have real words
+    let real_words = final_cleaned.split_whitespace()
+        .filter(|w| w.len() >= 3 && w.chars().filter(|c| c.is_alphabetic()).count() >= 2)
+        .count();
+    
+    let original_words = original_text.split_whitespace()
+        .filter(|w| w.len() >= 3 && w.chars().filter(|c| c.is_alphabetic()).count() >= 2)
+        .count();
+    
+    if real_words == 0 && original_words > 0 {
+        println!("[CLEAN] ⚠️ All real words removed, using original text");
+        return original_text;
+    }
+    
+    // SAFETY CHECK 3: Check specific important words
+    let important_words = ["fights", "building", "lmao", "lmfao", "back", "done", "fuck", "shit"];
+    check_word_preservation(&original_text, &final_cleaned, &important_words);
+    
+    final_cleaned
+}
+
+fn verify_tesseract() {
+    println!("[OCR] ===== Verifying Tesseract Installation =====");
+    
+    match Tesseract::new(None, Some("eng")) {
+        Ok(_) => {
+            println!("[OCR] ✅ Tesseract initialized successfully");
+            println!("[OCR] Language: English (eng)");
+        }
+        Err(e) => {
+            eprintln!("[OCR] ❌ Tesseract initialization FAILED: {}", e);
+            eprintln!("[OCR] Please ensure Tesseract is installed:");
+            eprintln!("[OCR]   macOS: brew install tesseract");
+            eprintln!("[OCR]   Linux: sudo apt-get install tesseract-ocr");
+            eprintln!("[OCR]   Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki");
+        }
+    }
+    
+    // Try to get Tesseract version info
+    match Tesseract::new(None, Some("eng")) {
+        Ok(tesseract) => {
+            // Try to set a variable to verify it works
+            match tesseract.set_variable("tessedit_pageseg_mode", "6") {
+                Ok(_) => println!("[OCR] ✅ Tesseract configuration test passed"),
+                Err(e) => println!("[OCR] ⚠️ Tesseract configuration warning: {:?}", e),
+            }
+        }
+        Err(_) => {}
+    }
+    
+    println!("[OCR] ============================================");
+}
+
+#[cfg(target_os = "macos")]
+fn run_ocr_vision(path: &Path) -> Result<String, String> {
+    use std::process::Command;
+    
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| "Image path is not valid UTF-8".to_string())?;
+    
+    // Find vision_ocr.swift in multiple locations
+    let mut script_locations = vec![
+        PathBuf::from("vision_ocr.swift"),
+        PathBuf::from("src-tauri/vision_ocr.swift"),
+        PathBuf::from("../vision_ocr.swift"),
+    ];
+    
+    // Add executable-relative paths
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            script_locations.push(parent.join("vision_ocr.swift"));
+            script_locations.push(parent.join("../Resources/vision_ocr.swift"));
+        }
+    }
+    
+    // Add current directory relative path
+    if let Ok(cwd) = std::env::current_dir() {
+        script_locations.push(cwd.join("src-tauri/vision_ocr.swift"));
+        script_locations.push(cwd.join("vision_ocr.swift"));
+    }
+    
+    let script_path = script_locations
+        .iter()
+        .find(|p| p.exists())
+        .ok_or_else(|| {
+            println!("[OCR] ❌ Could not find vision_ocr.swift");
+            println!("[OCR] Searched locations:");
+            for loc in &script_locations {
+                println!("[OCR]   - {} (exists: {})", loc.display(), loc.exists());
+            }
+            "vision_ocr.swift not found in any expected location".to_string()
+        })?;
+    
+    println!("[OCR] 🍎 Using Vision Framework: {}", script_path.display());
+    
+    let output = Command::new("swift")
+        .arg(script_path)
+        .arg(path_str)
+        .output()
+        .map_err(|e| format!("Failed to execute swift: {}. Is Swift installed?", e))?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Vision OCR failed: {}", stderr));
+    }
+    
+    let text = String::from_utf8(output.stdout)
+        .map_err(|e| format!("Invalid UTF-8 from Vision: {}", e))?
+        .trim()
+        .to_string();
+    
+    if text.starts_with("ERROR:") {
+        return Err(text);
+    }
+    
+    println!("[OCR] ✅ Vision extracted {} chars", text.len());
+    if text.len() < 200 {
+        println!("[OCR] Vision text: {}", text);
+    } else {
+        println!("[OCR] Vision preview: {}...", text.chars().take(150).collect::<String>());
+    }
+    
+    Ok(text)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_ocr_vision(_path: &Path) -> Result<String, String> {
+    Err("Apple Vision Framework is only available on macOS".to_string())
+}
+
+fn combine_ocr_results(vision_text: Option<String>, tesseract_text: Option<String>) -> String {
+    match (vision_text, tesseract_text) {
+        (Some(v), Some(t)) => {
+            println!("[OCR] Combining Vision ({} chars) + Tesseract ({} chars)", v.len(), t.len());
+            
+            // If one is significantly longer, prefer it
+            if v.len() > t.len() * 2 {
+                println!("[OCR] Using Vision (much longer)");
+                return v;
+            }
+            if t.len() > v.len() * 2 {
+                println!("[OCR] Using Tesseract (much longer)");
+                return t;
+            }
+            
+            // Otherwise, merge unique words from both
+            let mut all_words = Vec::new();
+            let mut seen = HashSet::new();
+            
+            // Prefer Vision words first (usually more accurate for UI)
+            for word in v.split_whitespace() {
+                let normalized = word.to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+                if !normalized.is_empty() && seen.insert(normalized.clone()) {
+                    all_words.push(word.to_string());
+                }
+            }
+            
+            // Add Tesseract words that Vision missed
+            for word in t.split_whitespace() {
+                let normalized = word.to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+                if !normalized.is_empty() && seen.insert(normalized.clone()) {
+                    all_words.push(word.to_string());
+                }
+            }
+            
+            let combined = all_words.join(" ");
+            println!("[OCR] Combined result: {} chars (unique words from both engines)", combined.len());
+            combined
+        }
+        (Some(v), None) => {
+            println!("[OCR] Using Vision only ({} chars)", v.len());
+            v
+        }
+        (None, Some(t)) => {
+            println!("[OCR] Using Tesseract only ({} chars)", t.len());
+            t
+        }
+        (None, None) => {
+            println!("[OCR] ❌ Both Vision and Tesseract failed");
+            String::new()
+        }
+    }
+}
+
+fn find_word_context(text: &str, word: &str, context_chars: usize) -> String {
+    let lower = text.to_lowercase();
+    if let Some(pos) = lower.find(&word.to_lowercase()) {
+        let start = pos.saturating_sub(context_chars);
+        let end = (pos + word.len() + context_chars).min(text.len());
+        format!("...{}...", &text[start..end])
+    } else {
+        String::new()
+    }
+}
+
+fn check_word_preservation(original: &str, cleaned: &str, important_words: &[&str]) {
+    println!("[CLEAN] Checking word preservation:");
+    for word in important_words {
+        let in_original = original.to_lowercase().contains(word);
+        let in_cleaned = cleaned.to_lowercase().contains(word);
+        
+        if in_original && !in_cleaned {
+            println!("[CLEAN] ❌ WARNING: '{}' was REMOVED during cleaning!", word);
+            println!("[CLEAN]    Original context: {}", find_word_context(original, word, 40));
+        } else if in_original && in_cleaned {
+            println!("[CLEAN] ✅ '{}' preserved", word);
+        }
+    }
+}
+
 fn run_ocr(path: &Path) -> Result<String, String> {
     let path_str = path
         .to_str()
         .ok_or_else(|| "Image path is not valid UTF-8".to_string())?;
     
-    // Build Tesseract - configuration is optional, so we'll use defaults if it fails
-    let tesseract = Tesseract::new(None, Some("eng"))
-        .map_err(|error| format!("{error}"))?;
+    println!("[OCR] ===== Starting multi-engine OCR for: {} =====", path_str);
     
-    // Try to configure for better text extraction, but continue with defaults if it fails
-    // Note: These settings are optional optimizations
-    let tesseract = tesseract
-        .set_variable("tessedit_pageseg_mode", "3")
-        .and_then(|t| t.set_variable("oem", "1"))
-        .unwrap_or_else(|_| {
-            // If configuration fails, recreate with defaults
-            // This is safe because Tesseract::new should always succeed if it succeeded before
-            Tesseract::new(None, Some("eng"))
-                .expect("Tesseract initialization should not fail after successful creation")
-        });
+    // Verify file
+    let metadata = fs::metadata(path)
+        .map_err(|e| format!("File not accessible: {}", e))?;
+    let file_size = metadata.len();
+    println!("[OCR] File size: {} bytes", file_size);
     
-    tesseract
-        .set_image(path_str)
-        .map_err(|error| format!("{error}"))?
-        .get_text()
-        .map_err(|error| format!("{error}"))
+    if file_size == 0 {
+        return Err("File is empty".to_string());
+    }
+    
+    // Get image info
+    if let Ok(img) = image::open(path) {
+        let (width, height) = img.dimensions();
+        println!("[OCR] Image dimensions: {}x{} pixels", width, height);
+    }
+    
+    let mut vision_result: Option<String> = None;
+    let mut tesseract_result: Option<String> = None;
+    
+    // TRY VISION FRAMEWORK (macOS only)
+    #[cfg(target_os = "macos")]
+    {
+        println!("[OCR] 🍎 Attempting Apple Vision Framework...");
+        match run_ocr_vision(path) {
+            Ok(text) if !text.trim().is_empty() => {
+                println!("[OCR] ✅ Vision success: {} chars", text.len());
+                vision_result = Some(text);
+            }
+            Ok(_) => {
+                println!("[OCR] ⚠️ Vision returned empty text");
+            }
+            Err(e) => {
+                println!("[OCR] ⚠️ Vision failed: {}", e);
+            }
+        }
+    }
+    
+    // TRY TESSERACT (always run, even if Vision succeeded - we'll combine results)
+    println!("[OCR] 🔄 Running Tesseract OCR...");
+    
+    let mut tesseract_paths = vec![path.to_path_buf()];
+    
+    // Add preprocessed version as fallback
+    if let Ok(preprocessed) = preprocess_image(path) {
+        println!("[OCR] ✅ Preprocessed image created");
+        tesseract_paths.push(preprocessed);
+    }
+    
+    match run_ocr_with_modes(path, &tesseract_paths) {
+        Ok(text) if !text.trim().is_empty() => {
+            println!("[OCR] ✅ Tesseract success: {} chars", text.len());
+            tesseract_result = Some(text);
+        }
+        Ok(_) => {
+            println!("[OCR] ⚠️ Tesseract returned empty text");
+        }
+        Err(e) => {
+            println!("[OCR] ⚠️ Tesseract failed: {}", e);
+        }
+    }
+    
+    // COMBINE RESULTS FROM BOTH ENGINES
+    let raw_combined = combine_ocr_results(vision_result, tesseract_result);
+    
+    if raw_combined.is_empty() {
+        return Err("Both OCR engines failed or returned empty results".to_string());
+    }
+    
+    println!("[OCR] Raw combined text: {} chars", raw_combined.len());
+    if raw_combined.len() < 200 {
+        println!("[OCR] Raw text: {}", raw_combined);
+    } else {
+        println!("[OCR] Raw preview: {}...", raw_combined.chars().take(150).collect::<String>());
+    }
+    
+    // APPLY CLEANING
+    let cleaned = clean_ocr_text(&raw_combined);
+    
+    println!("[OCR] After cleaning: {} chars (removed {} chars)", 
+        cleaned.len(), raw_combined.len().saturating_sub(cleaned.len()));
+    
+    // Safety check: if cleaning removed everything but we had content, use raw
+    if cleaned.is_empty() && raw_combined.len() > 10 {
+        println!("[OCR] ⚠️ Cleaning removed everything! Using raw text instead");
+        return Ok(raw_combined);
+    }
+    
+    if cleaned.len() < 100 {
+        println!("[OCR] Final text: {}", cleaned);
+    } else {
+        println!("[OCR] Final preview: {}...", cleaned.chars().take(100).collect::<String>());
+    }
+    
+    println!("[OCR] ===== OCR Complete =====");
+    Ok(cleaned)
+}
+
+fn run_ocr_with_modes(original_path: &Path, image_paths: &[PathBuf]) -> Result<String, String> {
+    // Try multiple PSM modes optimized for messaging apps and screenshots
+    // PSM 4 is particularly good for chat/messaging apps (single column, vertical text flow)
+    // PSM 11 is good for sparse text (like chat bubbles with gaps)
+    // PSM 6 works well for UI screenshots with uniform blocks
+    let psm_modes = vec![
+        ("4", "Single column (best for chat/messaging apps - vertical message flow)"),
+        ("11", "Sparse text (good for chat bubbles with gaps)"),
+        ("6", "Uniform block of text (good for UI screenshots)"),
+        ("3", "Fully automatic page segmentation"),
+        ("7", "Single text line"),
+        ("13", "Raw line (treat image as single text line)"),
+    ];
+    
+    let mut last_error = None;
+    let mut best_result = String::new();
+    let mut best_length = 0;
+    let mut best_source = "";
+    
+    // Try each image path (original and preprocessed)
+    for image_path in image_paths {
+        let image_type = if image_path == original_path { "original" } else { "preprocessed" };
+        println!("[OCR] Trying {} image", image_type);
+        
+        // Try each PSM mode
+        for (psm, desc) in &psm_modes {
+            match run_ocr_with_psm(image_path, psm, desc) {
+                Ok(text) => {
+                    let text_len = text.trim().len();
+                    println!("[OCR] {} image + PSM {} success: {} characters", image_type, psm, text_len);
+                    
+                    // Log a preview of the extracted text for debugging
+                    if text_len > 0 {
+                        let preview = text.chars().take(150).collect::<String>();
+                        println!("[OCR] Text preview ({} chars): {}", text_len, preview);
+                        
+                        // Check if text looks like messaging content (has timestamps, read receipts, etc.)
+                        let has_messaging_patterns = text.contains("PM") || text.contains("AM") || 
+                            text.contains("Read") || text.contains("Delivered") ||
+                            text.contains("Today") || text.contains("Yesterday") ||
+                            text.contains("Just now") || text.matches(":").count() > 3; // Multiple timestamps
+                        if has_messaging_patterns {
+                            println!("[OCR] ⚠️ Detected messaging app patterns - will apply aggressive cleaning");
+                        }
+                    }
+                    
+                    // Use the result with the most text
+                    if text_len > best_length {
+                        best_result = text;
+                        best_length = text_len;
+                        best_source = image_type;
+                    }
+                    
+                    // If we got a good result (more than 20 chars), use it immediately
+                    if text_len > 20 {
+                        println!("[OCR] ✅ Using result from {} image + PSM {} ({} chars)", image_type, psm, text_len);
+                        
+                        // Clean up temp files
+                        for temp_path in image_paths {
+                            if temp_path != original_path && temp_path.exists() {
+                                let _ = fs::remove_file(temp_path);
+                            }
+                        }
+                        
+                        // Apply text cleaning
+                        let cleaned = clean_ocr_text(&best_result);
+                        let cleaned_len = cleaned.len();
+                        if cleaned_len < best_result.len() {
+                            println!("[OCR] After cleaning: {} chars (removed {} chars of noise)", 
+                                cleaned_len, best_result.len() - cleaned_len);
+                            println!("[OCR] Cleaned preview: {}", cleaned.chars().take(100).collect::<String>());
+                        }
+                        
+                        return Ok(cleaned);
+                    }
+                }
+                Err(e) => {
+                    println!("[OCR] {} image + PSM {} failed: {}", image_type, psm, e);
+                    if last_error.is_none() {
+                        last_error = Some(e);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Clean up temp files
+    for temp_path in image_paths {
+        if temp_path != original_path && temp_path.exists() {
+            let _ = fs::remove_file(temp_path);
+        }
+    }
+    
+    // If we got any result, return it (after cleaning)
+    if best_length > 0 {
+        println!("[OCR] Using best result from {} image: {} characters", best_source, best_length);
+        
+        // Apply text cleaning
+        let cleaned = clean_ocr_text(&best_result);
+        let cleaned_len = cleaned.len();
+        if cleaned_len < best_result.len() {
+            println!("[OCR] After cleaning: {} chars (removed {} chars of noise)", 
+                cleaned_len, best_result.len() - cleaned_len);
+        }
+        
+        return Ok(cleaned);
+    }
+    
+    // If all failed, return detailed error
+    let error_msg = format!(
+        "All OCR attempts failed. Last error: {}. File: {}",
+        last_error.unwrap_or_else(|| "Unknown error".to_string()),
+        original_path.to_str().unwrap_or("unknown")
+    );
+    eprintln!("[OCR] ❌ {}", error_msg);
+    Err(error_msg)
 }
 
 fn summarize_text(text: &str) -> String {
@@ -258,6 +1011,95 @@ fn is_ignored(ignore_map: &Arc<Mutex<HashMap<PathBuf, Instant>>>, path: &Path) -
     guard.get(path).is_some()
 }
 
+// Database functions
+fn get_db_path(app: &AppHandle) -> PathBuf {
+    let app_data_dir = app.path().app_data_dir().expect("Failed to get app data directory");
+    fs::create_dir_all(&app_data_dir).expect("Failed to create app data directory");
+    app_data_dir.join("chronicle.db")
+}
+
+fn init_database(app: &AppHandle) -> SqlResult<Connection> {
+    let db_path = get_db_path(app);
+    let conn = Connection::open(&db_path)?;
+    
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL UNIQUE,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            processed_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )",
+        [],
+    )?;
+    
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_path ON entries(path)",
+        [],
+    )?;
+    
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_created_at ON entries(created_at)",
+        [],
+    )?;
+    
+    println!("[DB] Database initialized at: {}", db_path.display());
+    Ok(conn)
+}
+
+fn save_entry_to_db(app: &AppHandle, path: &str, text: &str, created_at: &str) -> SqlResult<()> {
+    let conn = init_database(app)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let now_str = now.to_string();
+    
+    conn.execute(
+        "INSERT OR REPLACE INTO entries (path, text, created_at, processed_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![path, text, created_at, now_str, now_str],
+    )?;
+    
+    println!("[DB] ✅ Saved entry: {} ({} chars)", path, text.len());
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct DbEntry {
+    path: String,
+    text: String,
+    at: String,
+}
+
+fn load_all_entries_from_db(app: &AppHandle) -> SqlResult<Vec<DbEntry>> {
+    let conn = init_database(app)?;
+    let mut stmt = conn.prepare("SELECT path, text, created_at FROM entries ORDER BY created_at DESC")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(DbEntry {
+            path: row.get(0)?,
+            text: row.get(1)?,
+            at: row.get(2)?,
+        })
+    })?;
+    
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row?);
+    }
+    
+    println!("[DB] ✅ Loaded {} entries from database", entries.len());
+    Ok(entries)
+}
+
+fn delete_entry_from_db(app: &AppHandle, path: &str) -> SqlResult<()> {
+    let conn = init_database(app)?;
+    conn.execute("DELETE FROM entries WHERE path = ?1", rusqlite::params![path])?;
+    println!("[DB] ✅ Deleted entry: {}", path);
+    Ok(())
+}
+
 fn process_screenshot(
     app: AppHandle,
     path: PathBuf,
@@ -286,28 +1128,89 @@ fn process_screenshot(
     match run_ocr(&path) {
         Ok(text) => {
             let trimmed = text.trim().to_string();
+            
+            // Log detailed results
+            if trimmed.is_empty() {
+                eprintln!("[OCR] ⚠️ WARNING: OCR returned EMPTY text for {}", path.display());
+                eprintln!("[OCR] This could indicate:");
+                eprintln!("[OCR]   1. Image has no readable text");
+                eprintln!("[OCR]   2. OCR configuration needs adjustment");
+                eprintln!("[OCR]   3. Image quality is too poor");
+            } else {
+                let char_count = trimmed.len();
+                let word_count = trimmed.split_whitespace().count();
+                println!("[OCR] ✅ Successfully extracted {} characters, {} words from {}", 
+                    char_count, word_count, path.display());
+                
+                // Check for specific words that user is looking for
+                let important_words = vec!["fights", "building", "lmao", "lmfao"];
+                let text_lower = trimmed.to_lowercase();
+                for word in &important_words {
+                    if text_lower.contains(word) {
+                        println!("[OCR] ✅ Found '{}' in extracted text", word);
+                        // Show context around the word
+                        if let Some(pos) = text_lower.find(word) {
+                            let start = pos.saturating_sub(20);
+                            let end = (pos + word.len() + 20).min(trimmed.len());
+                            println!("[OCR] Context: ...{}...", &trimmed[start..end]);
+                        }
+                    } else {
+                        println!("[OCR] ⚠️ '{}' NOT found in extracted text", word);
+                    }
+                }
+                
+                if char_count < 100 {
+                    println!("[OCR] Full text: {}", trimmed);
+                } else {
+                    println!("[OCR] Text preview: {}...", trimmed.chars().take(100).collect::<String>());
+                }
+            }
+            
             let final_path = match rename_with_text(&path, &trimmed) {
                 Ok(new_path) => {
-                    // Mark renamed path as known to prevent processing it again
+                    // Mark both original and renamed paths as known to prevent duplicate processing
                     {
                         let mut guard = known_map.lock().unwrap();
-                        guard.insert(new_path.clone());
+                        guard.insert(path.clone()); // Original path
+                        guard.insert(new_path.clone()); // Renamed path
+                        println!("[RENAME] Marked both paths as known: {} -> {}", path.display(), new_path.display());
                     }
                     remember_ignore(&ignore_map, &new_path);
+                    remember_ignore(&ignore_map, &path); // Also ignore original path
                     new_path
                 }
                 Err(error) => {
                     eprintln!("Rename failed for {}: {error}", path.display());
+                    // Still mark original as known even if rename failed
+                    {
+                        let mut guard = known_map.lock().unwrap();
+                        guard.insert(path.clone());
+                    }
                     path.clone()
                 }
             };
             remember_ignore(&ignore_map, &path);
-            println!("OCR result for {}:\n{}", final_path.display(), trimmed);
-            // Emit with the final path (renamed) and full text
+            
+            // Save to database
+            let created_at = get_file_created_at(&final_path)
+                .unwrap_or_else(|| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        .to_string()
+                });
+            if let Err(e) = save_entry_to_db(&app, &final_path.to_string_lossy(), &trimmed, &created_at) {
+                eprintln!("[DB] ⚠️ Failed to save entry to database: {}", e);
+            }
+            
+            // Always emit the text, even if empty (so frontend knows OCR ran)
+            // Emit with final_path (renamed path if successful, original if not)
             emit_status(&app, "idle", Some(&final_path), None, Some(trimmed));
         }
         Err(error) => {
-            eprintln!("OCR failed for {}: {error}", path.display());
+            eprintln!("[OCR] ❌ OCR failed for {}: {error}", path.display());
+            eprintln!("[OCR] Error details: {}", error);
             emit_status(&app, "idle", Some(&path), Some(error), None);
         }
     }
@@ -320,6 +1223,18 @@ fn handle_event(
     ignore_map: &Arc<Mutex<HashMap<PathBuf, Instant>>>,
     known_map: &Arc<Mutex<HashSet<PathBuf>>>,
 ) {
+    // Handle Remove events (happens when files are renamed)
+    if matches!(event.kind, EventKind::Remove(_)) {
+        // When a file is removed, it's likely a rename - mark it as known to prevent re-processing
+        for path in event.paths.iter() {
+            let mut guard = known_map.lock().unwrap();
+            guard.insert(path.clone());
+            println!("[WATCHER] File removed (likely renamed): {}, marking as known", path.display());
+        }
+        return;
+    }
+    
+    // Only process Create and Modify events
     if !matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
         return;
     }
@@ -438,11 +1353,22 @@ fn process_existing_screenshots(app: AppHandle, paths: Vec<PathBuf>) {
             match run_ocr(&path) {
                 Ok(text) => {
                     let trimmed = text.trim().to_string();
-                    println!("OCR result for {}:\n{}", path.display(), trimmed);
+                    
+                    // Log detailed results
+                    if trimmed.is_empty() {
+                        eprintln!("[OCR] ⚠️ WARNING: OCR returned EMPTY text for {}", path.display());
+                    } else {
+                        let char_count = trimmed.len();
+                        let word_count = trimmed.split_whitespace().count();
+                        println!("[OCR] ✅ Extracted {} chars, {} words from {}", 
+                            char_count, word_count, path.display());
+                    }
+                    
+                    // Always emit the text, even if empty
                     emit_status(&app, "idle", Some(&path), None, Some(trimmed));
                 }
                 Err(error) => {
-                    eprintln!("OCR failed for {}: {error}", path.display());
+                    eprintln!("[OCR] ❌ OCR failed for {}: {error}", path.display());
                     emit_status(&app, "idle", Some(&path), Some(error), None);
                 }
             }
@@ -514,7 +1440,7 @@ fn start_watcher(app: AppHandle) {
 }
 
 #[tauri::command]
-fn delete_files(paths: Vec<String>) -> Result<DeleteResult, String> {
+fn delete_files(app: AppHandle, paths: Vec<String>) -> Result<DeleteResult, String> {
     if paths.is_empty() {
         return Err("No files selected for deletion".to_string());
     }
@@ -533,6 +1459,8 @@ fn delete_files(paths: Vec<String>) -> Result<DeleteResult, String> {
         // Check if file exists first
         if !path.exists() {
             // File doesn't exist - treat as successful deletion (remove from index)
+            // Also remove from database
+            let _ = delete_entry_from_db(&app, &path_str);
             deleted.push(path_str);
             continue;
         }
@@ -566,6 +1494,8 @@ fn delete_files(paths: Vec<String>) -> Result<DeleteResult, String> {
         match fs::remove_file(&canonical_path) {
             Ok(_) => {
                 // Return the original path_str, not canonicalized, so it matches frontend entries
+                // Also remove from database
+                let _ = delete_entry_from_db(&app, &path_str);
                 deleted.push(path_str);
             }
             Err(e) => {
@@ -578,12 +1508,65 @@ fn delete_files(paths: Vec<String>) -> Result<DeleteResult, String> {
     Ok(DeleteResult { deleted, failed })
 }
 
+#[tauri::command]
+#[cfg(target_os = "macos")]
+fn copy_image_to_clipboard(path: String) -> Result<(), String> {
+    use std::process::Command;
+    
+    let path = PathBuf::from(&path);
+    if !path.exists() {
+        return Err(format!("File does not exist: {}", path.display()));
+    }
+    
+    let path_str = path.to_str().ok_or("Invalid path")?;
+    
+    // Use macOS osascript to copy image to clipboard
+    // This is more reliable than web clipboard APIs in Tauri
+    let script = format!(
+        r#"set the clipboard to (read file POSIX file "{}" as «class PNGf»)"#,
+        path_str.replace('"', "\\\"")
+    );
+    
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map_err(|e| format!("Failed to execute osascript: {}", e))?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!("Failed to copy image: {}\nStdout: {}", stderr, stdout));
+    }
+    
+    println!("[COPY] ✅ Image copied to clipboard via macOS osascript");
+    Ok(())
+}
+
+#[tauri::command]
+#[cfg(not(target_os = "macos"))]
+fn copy_image_to_clipboard(_path: String) -> Result<(), String> {
+    Err("Image clipboard copy is only supported on macOS".to_string())
+}
+
+#[tauri::command]
+fn load_all_entries(app: AppHandle) -> Result<Vec<DbEntry>, String> {
+    load_all_entries_from_db(&app)
+        .map_err(|e| format!("Failed to load entries: {}", e))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![delete_files])
+        .invoke_handler(tauri::generate_handler![
+            delete_files,
+            copy_image_to_clipboard,
+            load_all_entries
+        ])
         .setup(|app| {
+            // Verify Tesseract on startup
+            verify_tesseract();
             start_watcher(app.handle().clone());
             Ok(())
         })

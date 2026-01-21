@@ -6,8 +6,38 @@ function App() {
   const [status, setStatus] = useState("processing");
   const [lastPath, setLastPath] = useState("");
   const [lastError, setLastError] = useState("");
+  const [copySuccess, setCopySuccess] = useState(false);
   const [query, setQuery] = useState("");
   const [entries, setEntries] = useState([]);
+  
+  // Debug function - expose to window for console access
+  useEffect(() => {
+    window.debugChronicle = {
+      getEntries: () => entries,
+      getEntriesWithText: () => entries.filter(e => e.text && e.text.trim().length > 0),
+      searchInEntries: (searchTerm) => {
+        const term = searchTerm.toLowerCase();
+        return entries.filter(e => {
+          const text = (e.text || "").toLowerCase();
+          return text.includes(term);
+        });
+      },
+      inspectEntry: (index) => {
+        if (index >= 0 && index < entries.length) {
+          const entry = entries[index];
+          return {
+            path: entry.path,
+            text: entry.text,
+            textLength: (entry.text || "").length,
+            hasText: !!(entry.text && entry.text.trim().length > 0),
+            at: entry.at
+          };
+        }
+        return null;
+      }
+    };
+    console.log("[DEBUG] Chronicle debug functions available. Try: window.debugChronicle.getEntries()");
+  }, [entries]);
   const [selectedPath, setSelectedPath] = useState("");
   const [selectedPaths, setSelectedPaths] = useState([]);
   const [viewerPath, setViewerPath] = useState("");
@@ -75,19 +105,24 @@ function App() {
   }, []);
 
   const isOcrTextValid = useCallback((text) => {
-    if (!text || text.trim().length < 2) return false;
+    if (!text || text.trim().length < 1) return false;
     const trimmed = text.trim();
     const words = trimmed.split(/\s+/).filter((w) => w.length > 0);
     if (words.length === 0) return false;
+    // More lenient validation - accept text with at least some alphanumeric content
     const validChars = trimmed.match(/[a-zA-Z0-9]/g) || [];
     const totalChars = trimmed.length;
     if (totalChars === 0) return false;
     const validRatio = validChars.length / totalChars;
-    if (validRatio < 0.2) return false;
+    // Lower threshold - accept text with at least 10% valid characters (was 20%)
+    if (validRatio < 0.1) return false;
+    // More lenient word length check
     const avgWordLength = words.reduce((sum, w) => sum + w.length, 0) / words.length;
-    if (avgWordLength > 25) return false;
-    if (words.length === 1 && words[0].length < 2) return false;
-    const hasReasonableContent = words.some((w) => w.length >= 2 && /[a-zA-Z]/.test(w));
+    if (avgWordLength > 30) return false; // Increased from 25
+    // Accept single words if they're reasonable
+    if (words.length === 1 && words[0].length >= 2) return true;
+    // Check for reasonable content - at least one word with letters
+    const hasReasonableContent = words.some((w) => w.length >= 1 && /[a-zA-Z0-9]/.test(w));
     return hasReasonableContent;
   }, []);
 
@@ -104,18 +139,146 @@ function App() {
     return truncated + "...";
   }, []);
 
+  // Helper function to normalize text for search (fixes common OCR mistakes)
+  const normalizeSearchText = useCallback((text) => {
+    if (!text) return "";
+    let normalized = String(text).toLowerCase();
+    
+    // Fix common OCR mistakes that match what we fix in Rust
+    // "I" -> "l" at start of lowercase words
+    normalized = normalized.replace(/\bima+/g, "lma");
+    normalized = normalized.replace(/\bimfa+/g, "lmfa");
+    normalized = normalized.replace(/\biol/g, "lol");
+    
+    // Fix "0" -> "o" in words
+    normalized = normalized.replace(/([a-z])0+([a-z])/g, "$1o$2");
+    
+    // Fix "5" -> "s" in words
+    normalized = normalized.replace(/([a-z])5([a-z])/g, "$1s$2");
+    
+    // Fix "1" -> "l" in words
+    normalized = normalized.replace(/([a-z])1([a-z])/g, "$1l$2");
+    
+    return normalized;
+  }, []);
+
   const filteredEntries = useMemo(() => {
     const normalized = query.trim().toLowerCase();
-    const filtered = normalized
-      ? entries.filter((entry) => {
-          const pathMatch = entry.path.toLowerCase().includes(normalized);
-          const textMatch = entry.text.toLowerCase().includes(normalized);
-          return pathMatch || textMatch;
-        })
-      : entries;
+    if (!normalized) {
+      return [...entries].sort((a, b) => {
+        const dateA = new Date(a.at).getTime();
+        const dateB = new Date(b.at).getTime();
+        return dateB - dateA;
+      });
+    }
+    
+    // Normalize the search query to handle OCR mistakes
+    const normalizedQuery = normalizeSearchText(normalized);
+    
+    console.log(`[SEARCH] Starting search for: "${normalized}" (normalized: "${normalizedQuery}")`);
+    console.log(`[SEARCH] Total entries to search: ${entries.length}`);
+    
+    const filtered = entries.filter((entry) => {
+      // Search in path (exact substring match)
+      const pathMatch = entry.path?.toLowerCase().includes(normalized) || false;
+      
+      // Search in OCR text - handle empty/undefined text
+      const entryText = (entry.text || "").trim();
+      if (!entryText) {
+        // No text to search, only match by path
+        return pathMatch;
+      }
+      
+      // Normalize entry text to handle OCR mistakes (e.g., "Imaooo" -> "lmao")
+      const normalizedEntryText = normalizeSearchText(entryText);
+      const entryTextLower = entryText.toLowerCase();
+      
+      // Try both normalized and original matching
+      const normalizedMatch = normalizedEntryText.includes(normalizedQuery);
+      const exactMatch = entryTextLower.includes(normalized);
+      
+      // Debug specific words
+      if (normalized === "fights" || normalized === "building") {
+        console.log(`[SEARCH] Checking '${normalized}' in entry:`, {
+          path: entry.path.split("/").pop(),
+          entryTextLength: entryText.length,
+          entryTextPreview: entryText.substring(0, 100),
+          entryTextLower: entryTextLower.substring(0, 100),
+          normalizedEntryText: normalizedEntryText.substring(0, 100),
+          exactMatch,
+          normalizedMatch,
+          pathMatch
+        });
+      }
+      
+      // Simple substring match - this should work
+      const result = pathMatch || exactMatch || normalizedMatch;
+      
+      // Debug logging for ALL entries to see why they match or don't
+      if (entryText.length > 0) {
+        const hasQuery = entryTextLower.includes(normalized);
+        if (hasQuery && !result) {
+          console.warn(`[SEARCH] BUG: Entry has query but didn't match!`, {
+            path: entry.path.split("/").pop(),
+            query: normalized,
+            textPreview: entryText.substring(0, 100),
+            entryTextLower: entryTextLower.substring(0, 100),
+            includes: entryTextLower.includes(normalized)
+          });
+        }
+      }
+      
+      return result;
+    });
     
     if (entries.length > 0) {
-      console.log("[FILTER] Total entries:", entries.length, "Query:", query, "Filtered:", filtered.length);
+      const entriesWithText = entries.filter(e => e.text && e.text.trim().length > 0).length;
+      const entriesWithoutText = entries.length - entriesWithText;
+      console.log("[FILTER] Total entries:", entries.length, "With text:", entriesWithText, "Without text:", entriesWithoutText, "Query:", query, "Filtered:", filtered.length);
+      
+      // Debug: show sample of entry texts for the query
+      if (normalized && filtered.length === 0) {
+        console.log("[SEARCH] ❌ No results found for:", normalized);
+        console.log("[SEARCH] Checking if query exists in any entry...");
+        
+        // Check if the query word exists anywhere
+        const queryInAnyEntry = entries.some(e => {
+          const text = (e.text || "").toLowerCase();
+          return text.includes(normalized);
+        });
+        console.log("[SEARCH] Query word found in any entry:", queryInAnyEntry);
+        
+        if (queryInAnyEntry) {
+          console.warn("[SEARCH] ⚠️ BUG: Query exists in entries but search returned no results!");
+          // Find which entries have it
+          const entriesWithQuery = entries.filter(e => {
+            const text = (e.text || "").toLowerCase();
+            return text.includes(normalized);
+          });
+          console.log("[SEARCH] Entries that should match:", entriesWithQuery.map(e => ({
+            path: e.path.split("/").pop(),
+            textLength: (e.text || "").length,
+            textPreview: (e.text || "").substring(0, 100),
+            queryPosition: (e.text || "").toLowerCase().indexOf(normalized)
+          })));
+        }
+        
+        // Show sample entries with their text
+        console.log("[SEARCH] Sample entry texts:", entries.slice(0, 5).map(e => {
+          const text = e.text || "";
+          const hasQuery = text.toLowerCase().includes(normalized);
+          return {
+            path: e.path.split("/").pop(),
+            textLength: text.length,
+            textPreview: text.substring(0, 80),
+            hasText: text.trim().length > 0,
+            containsQuery: hasQuery,
+            words: text.toLowerCase().split(/\s+/).filter(w => w.length >= 3).slice(0, 10)
+          };
+        }));
+      } else if (normalized && filtered.length > 0) {
+        console.log(`[SEARCH] ✅ Found ${filtered.length} results for:`, normalized);
+      }
     }
     
     return [...filtered].sort((a, b) => {
@@ -211,6 +374,7 @@ function App() {
     setSelectedPaths([]);
   }, []);
 
+
   const deleteSelected = useCallback(async () => {
     if (!selectedPaths.length) {
       return;
@@ -269,24 +433,58 @@ function App() {
 
   const copyViewerImage = useCallback(async () => {
     if (!viewerPath) {
+      setLastError("No image to copy");
       return;
     }
+    
+    console.log("[COPY] Starting copy for:", viewerPath);
+    
     try {
-      const response = await fetch(convertFileSrc(viewerPath));
-      const blob = await response.blob();
-      if (navigator.clipboard && window.ClipboardItem) {
-        await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
-        setLastError("");
-        return;
-      }
-      await navigator.clipboard.writeText(viewerPath);
-      setLastError("Image copy not supported. Copied file path instead.");
+      // Use Tauri backend command for reliable clipboard copy
+      await invoke("copy_image_to_clipboard", { path: viewerPath });
+      setLastError("");
+      setCopySuccess(true);
+      setTimeout(() => setCopySuccess(false), 2000);
+      console.log("[COPY] ✅ Image copied to clipboard successfully");
     } catch (error) {
+      console.error("[COPY] Error:", error);
       setLastError(`Failed to copy image: ${String(error)}`);
+      
+      // Fallback: try to copy the path
+      try {
+        await navigator.clipboard.writeText(viewerPath);
+        setLastError(`Image copy failed. Copied file path instead: ${String(error)}`);
+      } catch (pathError) {
+        setLastError(`Failed to copy: ${String(error)}`);
+      }
     }
   }, [viewerPath]);
 
 
+
+  // Load entries from database on app startup
+  useEffect(() => {
+    const loadEntries = async () => {
+      try {
+        console.log("[DB] Loading entries from database...");
+        const dbEntries = await invoke("load_all_entries");
+        if (Array.isArray(dbEntries) && dbEntries.length > 0) {
+          console.log("[DB] ✅ Loaded", dbEntries.length, "entries from database");
+          setEntries(dbEntries.map(entry => ({
+            path: entry.path,
+            text: entry.text || "",
+            at: entry.at || new Date().toISOString()
+          })));
+        } else {
+          console.log("[DB] No entries found in database");
+        }
+      } catch (error) {
+        console.error("[DB] Failed to load entries:", error);
+      }
+    };
+    
+    loadEntries();
+  }, []);
 
   useEffect(() => {
     let unlisten;
@@ -299,12 +497,30 @@ function App() {
       setLastPath(payload.path ?? "");
       setLastError(payload.error ?? "");
 
-      if (payload.path) {
-        const text = payload.text || "";
+      // Only add/update entries when OCR is complete (status "idle")
+      // Don't add entries during "processing" - that causes duplicates
+      if (payload.path && nextStatus === "idle") {
+        // CRITICAL: Get text and verify it's actually there
+        const rawText = payload.text;
+        const text = rawText ? String(rawText).trim() : "";
         const pathStr = String(payload.path).trim();
+        
+        console.log("[OCR] ===== RECEIVED OCR RESULT =====");
+        console.log("[OCR] Path:", pathStr);
+        console.log("[OCR] Raw text type:", typeof rawText, "Value:", rawText);
+        console.log("[OCR] Processed text length:", text.length);
+        console.log("[OCR] Text preview (first 200 chars):", text.substring(0, 200));
+        console.log("[OCR] Status:", nextStatus);
+        console.log("[OCR] Has error:", !!payload.error);
+        
         if (!pathStr) {
           console.log("[OCR] Empty path, skipping");
           return;
+        }
+        
+        // Warn if we're not getting text when we should
+        if (!text && nextStatus === "idle" && !payload.error) {
+          console.warn("[OCR] ⚠️ WARNING: No text received but status is 'idle' and no error!");
         }
         
         // Get file creation date from metadata, fall back to current time if not available
@@ -321,10 +537,29 @@ function App() {
           }
         }
         
-        console.log("[OCR] Processing entry:", pathStr);
-        console.log("[OCR] Text received:", text.substring(0, 100), "Length:", text.length);
-        console.log("[OCR] Text valid:", isOcrTextValid(text), "Status:", nextStatus);
-        console.log("[OCR] File created at:", createdAt);
+        // Log searchable words for debugging
+        if (text.length > 0) {
+          const words = text.toLowerCase().split(/\s+/).filter(w => w.length >= 3);
+          const textLower = text.toLowerCase();
+          
+          // Check for specific important words
+          const importantWords = ["fights", "building", "lmao", "lmfao"];
+          importantWords.forEach(word => {
+            if (textLower.includes(word)) {
+              console.log(`[OCR] ✅ FOUND '${word}' in text! Position:`, textLower.indexOf(word));
+              // Show context
+              const pos = textLower.indexOf(word);
+              const context = text.substring(Math.max(0, pos - 30), Math.min(text.length, pos + word.length + 30));
+              console.log(`[OCR] Context for '${word}': ...${context}...`);
+            } else {
+              console.log(`[OCR] ⚠️ '${word}' NOT found in extracted text`);
+            }
+          });
+          
+          console.log("[OCR] Searchable words sample:", words.slice(0, 15).join(", "));
+        } else {
+          console.warn("[OCR] ⚠️ No text extracted for:", pathStr);
+        }
         setEntries((current) => {
           const normalizedPath = pathStr.replace(/\/+/g, "/").replace(/\/$/, "");
           const normalizedPathLower = normalizePath(pathStr);
@@ -343,68 +578,214 @@ function App() {
           const newBasename = getBasename(normalizedPath);
           const newDir = getDir(normalizedPath);
           
-          // Find existing entry by exact path match or normalized path match only
-          // Don't match by timestamp - that causes false positives with different files
+          // Find existing entry by exact path match or normalized path match
+          // Also check if this might be a renamed file by comparing creation dates
+          // When a file is renamed, it keeps the same creation date, so we can match on that
           const existingIndex = current.findIndex((entry) => {
             const entryPath = String(entry.path).trim().replace(/\/+/g, "/").replace(/\/$/, "");
             const entryPathLower = normalizePath(entry.path);
+            const normalizedPathLower = normalizePath(normalizedPath);
             
-            // Only match exact or normalized path - be strict to avoid false duplicates
-            return entryPath === normalizedPath || entryPathLower === normalizedPathLower;
+            // Match exact or normalized path
+            if (entryPath === normalizedPath || entryPathLower === normalizedPathLower) {
+              return true;
+            }
+            
+            // Check if this might be a renamed file:
+            // 1. Same creation date (within 1 second tolerance)
+            // 2. Different paths
+            // 3. Both are PNG files
+            const entryDate = new Date(entry.at || 0).getTime();
+            const newDate = new Date(createdAt).getTime();
+            const dateDiff = Math.abs(entryDate - newDate);
+            
+            if (dateDiff < 2000 && // Within 2 seconds (same file, just renamed)
+                entryPath !== normalizedPath && // Different paths
+                entryPath.endsWith('.png') && normalizedPath.endsWith('.png')) { // Both PNGs
+              console.log("[DEDUP] Potential rename detected by date:", entryPath, "->", normalizedPath, "Date diff:", dateDiff, "ms");
+              return true;
+            }
+            
+            return false;
           });
+          
+          // CRITICAL: Ensure text is stored - don't trim if it would make it empty, but do trim whitespace
+          const textToStore = text ? String(text).trim() : "";
           
           const nextEntry = {
             path: normalizedPath,
-            text: text, // Store full text, not truncated
+            text: textToStore, // Store full text, ensure it's a string
             at: existingIndex >= 0 ? current[existingIndex].at : createdAt, // Preserve original creation date for updates
           };
+          
+          // CRITICAL VERIFICATION: Log exactly what we're storing
+          console.log("[OCR] ===== STORING ENTRY =====");
+          console.log("[OCR] Entry object:", {
+            path: nextEntry.path,
+            textLength: nextEntry.text.length,
+            textType: typeof nextEntry.text,
+            textValue: nextEntry.text.substring(0, 100),
+            hasText: !!nextEntry.text && nextEntry.text.length > 0,
+            at: nextEntry.at
+          });
+          
+          // Verify text is being stored
+          if (nextEntry.text.length > 0) {
+            const wordCount = nextEntry.text.split(/\s+/).filter(w => w.length > 0).length;
+            const textLower = nextEntry.text.toLowerCase();
+            const hasLmao = textLower.includes("lmao");
+            console.log("[OCR] ✅ Storing text:", {
+              path: normalizedPath.split("/").pop(),
+              textLength: nextEntry.text.length,
+              wordCount: wordCount,
+              textPreview: nextEntry.text.substring(0, 100),
+              sampleWords: textLower.split(/\s+/).filter(w => w.length >= 3).slice(0, 5).join(", "),
+              hasLmao: hasLmao
+            });
+            if (hasLmao) {
+              console.log("[OCR] 🎯 THIS ENTRY CONTAINS 'lmao' - it should be searchable!");
+            }
+          } else {
+            console.warn("[OCR] ⚠️ WARNING: Storing entry with NO TEXT for:", normalizedPath);
+          }
           
           let updated;
           if (existingIndex >= 0) {
             updated = [...current];
-            // Update existing entry with new path and text, but preserve original creation date
+            const oldEntry = current[existingIndex];
+            const oldText = String(oldEntry.text || "").trim();
+            const newText = String(nextEntry.text || "").trim();
+            
+            console.log("[OCR] ===== UPDATING EXISTING ENTRY =====");
+            console.log("[OCR] Old entry text length:", oldText.length);
+            console.log("[OCR] New entry text length:", newText.length);
+            console.log("[OCR] Old text preview:", oldText.substring(0, 50));
+            console.log("[OCR] New text preview:", newText.substring(0, 50));
+            
+            // Merge text: use the longer text, or combine if both have unique content
+            let mergedText = newText;
+            if (oldText.length > newText.length && oldText.length > 0) {
+              // Old text is longer - check if new text adds anything
+              const oldWords = new Set(oldText.toLowerCase().split(/\s+/));
+              const newWords = newText.toLowerCase().split(/\s+/).filter(w => w.length >= 2);
+              const uniqueNewWords = newWords.filter(w => !oldWords.has(w));
+              
+              if (uniqueNewWords.length > 0) {
+                // New text has unique words - merge them
+                mergedText = oldText + " " + uniqueNewWords.join(" ");
+                console.log("[OCR] Merging text: old text +", uniqueNewWords.length, "new unique words");
+              } else {
+                // Keep old text if it's longer and new text doesn't add anything
+                mergedText = oldText;
+                console.log("[OCR] Keeping old text (longer and no new unique words)");
+              }
+            } else if (newText.length > 0) {
+              // New text is longer or old text is empty - use new text
+              mergedText = newText;
+              console.log("[OCR] Using new text (longer or old was empty)");
+            }
+            
+            // Update existing entry with merged text
             updated[existingIndex] = { 
-              ...current[existingIndex], 
-              path: nextEntry.path,
-              text: nextEntry.text,
+              ...oldEntry, 
+              path: nextEntry.path, // Update path in case file was renamed
+              text: mergedText.trim(), // Use merged text
               // Keep original 'at' (creation date) - don't overwrite it
             };
-            console.log("[OCR] Entry updated at index", existingIndex, "Old path:", current[existingIndex].path, "New path:", normalizedPath);
+            
+            console.log("[OCR] After update, entry text length:", String(updated[existingIndex].text || "").length);
+            console.log("[OCR] Entry updated at index", existingIndex, "Old path:", oldEntry.path, "New path:", normalizedPath);
           } else {
             updated = [nextEntry, ...current];
-            console.log("[OCR] New entry added. Total entries:", updated.length, "Path:", normalizedPath, "Created at:", createdAt);
+            console.log("[OCR] ===== ADDING NEW ENTRY =====");
+            console.log("[OCR] New entry added. Total entries:", updated.length, "Path:", normalizedPath, "Text length:", nextEntry.text.length, "Created at:", createdAt);
           }
           
           // More robust deduplication: remove ALL duplicates, not just first match
+          // Also handle cases where files are renamed (original path vs renamed path)
           const seen = new Set();
-          const unique = updated.filter((entry) => {
+          const pathToEntry = new Map(); // Track best entry for each normalized path
+          
+          // First pass: identify duplicates and keep the best entry for each path
+          updated.forEach((entry) => {
             const entryPath = String(entry.path).trim().replace(/\/+/g, "/").replace(/\/$/, "");
             const entryPathLower = normalizePath(entry.path);
-            if (seen.has(entryPathLower) || seen.has(entryPath)) {
-              return false;
+            const entryText = String(entry.text || "").trim();
+            
+            // Use normalized path as key
+            const key = entryPathLower;
+            
+            if (pathToEntry.has(key)) {
+              // Duplicate found - keep the one with more text
+              const existing = pathToEntry.get(key);
+              const existingText = String(existing.text || "").trim();
+              
+              if (entryText.length > existingText.length) {
+                console.log("[DEDUP] Replacing duplicate with longer text:", key, "Old:", existingText.length, "New:", entryText.length);
+                pathToEntry.set(key, entry);
+              } else {
+                console.log("[DEDUP] Keeping existing entry (longer text):", key);
+              }
+            } else {
+              pathToEntry.set(key, entry);
             }
+            
             seen.add(entryPathLower);
             seen.add(entryPath);
-            return true;
           });
           
+          // Convert map back to array
+          const unique = Array.from(pathToEntry.values());
+          
           if (unique.length !== updated.length) {
-            console.log("[OCR] Removed duplicates:", updated.length - unique.length, "Original:", updated.length, "Unique:", unique.length);
+            console.log("[DEDUP] Removed duplicates:", updated.length - unique.length, "Original:", updated.length, "Unique:", unique.length);
           }
           
           const sorted = [...unique].sort((a, b) => {
             const dateA = new Date(a.at || 0).getTime();
             const dateB = new Date(b.at || 0).getTime();
             if (dateB !== dateA) {
-              return dateB - dateA;
+              return dateB - dateA; // Newest first
             }
-            return String(b.path).localeCompare(String(a.path));
+            // If dates are equal, sort by path to ensure consistent ordering
+            return String(a.path).localeCompare(String(b.path));
           });
           
           if (sorted.length > 0) {
             const firstDate = new Date(sorted[0].at);
             const lastDate = new Date(sorted[sorted.length - 1].at);
-            console.log("[OCR] Sorted entries - First:", firstDate.toLocaleString(), "Last:", lastDate.toLocaleString(), "Total:", sorted.length);
+            const entriesWithText = sorted.filter(e => e.text && e.text.trim().length > 0).length;
+            console.log("[OCR] Sorted entries - First:", firstDate.toLocaleString(), "Last:", lastDate.toLocaleString(), "Total:", sorted.length, "With text:", entriesWithText);
+            
+          // CRITICAL VERIFICATION: Check the entry after all processing
+          const newEntry = sorted.find(e => e.path === normalizedPath);
+          if (newEntry) {
+            const hasText = !!(newEntry.text && String(newEntry.text).trim().length > 0);
+            const textValue = String(newEntry.text || "");
+            const hasLmao = textValue.toLowerCase().includes("lmao");
+            
+            console.log("[OCR] ===== FINAL VERIFICATION =====");
+            console.log("[OCR] Entry after processing:", {
+              path: normalizedPath.split("/").pop(),
+              hasText: hasText,
+              textLength: textValue.length,
+              textType: typeof newEntry.text,
+              textPreview: textValue.substring(0, 100),
+              hasLmao: hasLmao,
+              allKeys: Object.keys(newEntry)
+            });
+            
+            if (!hasText && text.length > 0) {
+              console.error("[OCR] ❌ ERROR: Text was lost during processing! Original length:", text.length);
+            }
+            
+            if (hasLmao) {
+              console.log("[OCR] ✅✅✅ ENTRY CONTAINS 'lmao' AND IS STORED - SHOULD BE SEARCHABLE!");
+            }
+          } else {
+            console.error("[OCR] ❌ ERROR: Entry not found after processing!");
+          }
+            
             if (sorted.length > 1 && firstDate < lastDate) {
               console.warn("[OCR] WARNING: Entries not sorted correctly! First entry is older than last entry.");
             }
@@ -662,7 +1043,7 @@ function App() {
             <p>
               {filteredEntries.length} result{filteredEntries.length === 1 ? "" : "s"}
             </p>
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center gap-1.5">
               {filteredEntries.length > 0 ? (
                 <span className="normal-case tracking-normal text-slate-300/80">
                   {currentIndex + 1} of {filteredEntries.length}
@@ -695,22 +1076,6 @@ function App() {
               >
                 Delete
               </button>
-              <button
-                type="button"
-                onClick={selectPrevious}
-                disabled={!filteredEntries.length}
-                className="rounded-lg border border-slate-700/70 bg-[#0f1114] px-2 py-1 text-[11px] text-slate-200 transition enabled:hover:border-slate-500/70 enabled:hover:text-slate-100 disabled:opacity-40"
-              >
-                Prev
-              </button>
-              <button
-                type="button"
-                onClick={selectNext}
-                disabled={!filteredEntries.length}
-                className="rounded-lg border border-slate-700/70 bg-[#0f1114] px-2 py-1 text-[11px] text-slate-200 transition enabled:hover:border-slate-500/70 enabled:hover:text-slate-100 disabled:opacity-40"
-              >
-                Next
-              </button>
             </div>
           </div>
           <div className="mt-4">
@@ -722,7 +1087,7 @@ function App() {
                 </p>
               </div>
             ) : (
-              <div className="max-h-[calc(100vh-280px)] space-y-6 overflow-y-auto pr-1">
+              <div className="max-h-[calc(100vh-280px)] space-y-6 overflow-y-auto pr-2" style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}>
                 {groupedEntries.map(([groupName, groupEntries]) => (
                   <div key={groupName}>
                     <h3 className="mb-4 text-xs font-semibold uppercase tracking-[0.15em] text-white/50">
@@ -835,9 +1200,13 @@ function App() {
                   <button
                     type="button"
                     onClick={copyViewerImage}
-                    className="rounded-lg border border-slate-700/70 bg-[#0f1114] px-3 py-1 text-[11px] text-slate-200 transition hover:border-slate-500/70 hover:text-slate-100"
+                    className={`rounded-lg border px-3 py-1 text-[11px] transition ${
+                      copySuccess
+                        ? "border-emerald-500/70 bg-emerald-500/10 text-emerald-200"
+                        : "border-slate-700/70 bg-[#0f1114] text-slate-200 hover:border-slate-500/70 hover:text-slate-100"
+                    }`}
                   >
-                    Copy
+                    {copySuccess ? "Copied!" : "Copy"}
                   </button>
                   <button
                     type="button"
