@@ -17,12 +17,53 @@ struct OcrStatus {
     path: Option<String>,
     error: Option<String>,
     text: Option<String>,
+    created_at: Option<String>,
 }
 
 #[derive(Serialize)]
 struct DeleteResult {
     deleted: Vec<String>,
     failed: Vec<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct BatchProgress {
+    total: usize,
+    completed: usize,
+    percent: f64,
+    eta_seconds: u64,
+    in_progress: bool,
+}
+
+fn emit_batch_progress(app: &AppHandle, progress: BatchProgress) {
+    if let Err(error) = app.emit("batch-progress", progress) {
+        eprintln!("Failed to emit batch progress: {error}");
+    }
+}
+
+fn get_file_created_at(path: &Path) -> Option<String> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| {
+            // Try created() first (file creation time), fall back to modified() if not available
+            // On some systems, created() may not be available, so we use modified() as fallback
+            metadata.created()
+                .or_else(|_| metadata.modified())
+                .ok()
+        })
+        .and_then(|system_time| {
+            system_time
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|duration| {
+                    // Convert to milliseconds for JavaScript Date constructor
+                    let secs = duration.as_secs();
+                    let nanos = duration.subsec_nanos();
+                    // Convert nanoseconds to milliseconds and add to seconds
+                    let millis = secs * 1000 + (nanos / 1_000_000) as u64;
+                    format!("{}", millis)
+                })
+        })
 }
 
 fn emit_status(
@@ -32,11 +73,14 @@ fn emit_status(
     error: Option<String>,
     text: Option<String>,
 ) {
+    let created_at = path.and_then(|p| get_file_created_at(p));
+    
     let payload = OcrStatus {
         status: status.to_string(),
         path: path.and_then(|value| value.to_str()).map(|value| value.to_string()),
         error,
         text,
+        created_at,
     };
 
     if let Err(error) = app.emit("ocr-status", payload) {
@@ -96,8 +140,24 @@ fn run_ocr(path: &Path) -> Result<String, String> {
     let path_str = path
         .to_str()
         .ok_or_else(|| "Image path is not valid UTF-8".to_string())?;
-    Tesseract::new(None, Some("eng"))
-        .map_err(|error| format!("{error}"))?
+    
+    // Build Tesseract - configuration is optional, so we'll use defaults if it fails
+    let tesseract = Tesseract::new(None, Some("eng"))
+        .map_err(|error| format!("{error}"))?;
+    
+    // Try to configure for better text extraction, but continue with defaults if it fails
+    // Note: These settings are optional optimizations
+    let tesseract = tesseract
+        .set_variable("tessedit_pageseg_mode", "3")
+        .and_then(|t| t.set_variable("oem", "1"))
+        .unwrap_or_else(|_| {
+            // If configuration fails, recreate with defaults
+            // This is safe because Tesseract::new should always succeed if it succeeded before
+            Tesseract::new(None, Some("eng"))
+                .expect("Tesseract initialization should not fail after successful creation")
+        });
+    
+    tesseract
         .set_image(path_str)
         .map_err(|error| format!("{error}"))?
         .get_text()
@@ -204,7 +264,18 @@ fn process_screenshot(
     ignore_map: Arc<Mutex<HashMap<PathBuf, Instant>>>,
     known_map: Arc<Mutex<HashSet<PathBuf>>>,
 ) {
+    // Mark original path as known immediately to prevent duplicate processing
+    {
+        let mut guard = known_map.lock().unwrap();
+        guard.insert(path.clone());
+    }
+    
     emit_status(&app, "processing", Some(&path), None, None);
+
+    if !path.exists() {
+        emit_status(&app, "idle", Some(&path), None, None);
+        return;
+    }
 
     if let Err(error) = wait_for_file(&path) {
         eprintln!("File not ready: {} ({error})", path.display());
@@ -216,18 +287,23 @@ fn process_screenshot(
         Ok(text) => {
             let trimmed = text.trim().to_string();
             let final_path = match rename_with_text(&path, &trimmed) {
-                Ok(new_path) => new_path,
+                Ok(new_path) => {
+                    // Mark renamed path as known to prevent processing it again
+                    {
+                        let mut guard = known_map.lock().unwrap();
+                        guard.insert(new_path.clone());
+                    }
+                    remember_ignore(&ignore_map, &new_path);
+                    new_path
+                }
                 Err(error) => {
                     eprintln!("Rename failed for {}: {error}", path.display());
                     path.clone()
                 }
             };
-            remember_ignore(&ignore_map, &final_path);
-            {
-                let mut guard = known_map.lock().unwrap();
-                guard.insert(final_path.clone());
-            }
+            remember_ignore(&ignore_map, &path);
             println!("OCR result for {}:\n{}", final_path.display(), trimmed);
+            // Emit with the final path (renamed) and full text
             emit_status(&app, "idle", Some(&final_path), None, Some(trimmed));
         }
         Err(error) => {
@@ -307,11 +383,55 @@ fn load_existing_screenshots(watch_dirs: &[PathBuf]) -> Vec<PathBuf> {
 
 fn process_existing_screenshots(app: AppHandle, paths: Vec<PathBuf>) {
     tauri::async_runtime::spawn_blocking(move || {
+        let total = paths.len();
+        if total == 0 {
+            emit_batch_progress(
+                &app,
+                BatchProgress {
+                    total: 0,
+                    completed: 0,
+                    percent: 100.0,
+                    eta_seconds: 0,
+                    in_progress: false,
+                },
+            );
+            return;
+        }
+
+        emit_batch_progress(
+            &app,
+            BatchProgress {
+                total,
+                completed: 0,
+                percent: 0.0,
+                eta_seconds: 0,
+                in_progress: true,
+            },
+        );
+
+        let mut completed = 0usize;
+        let mut total_elapsed = Duration::from_secs(0);
+
         for path in paths {
+            let start = Instant::now();
             emit_status(&app, "processing", Some(&path), None, None);
             if let Err(error) = wait_for_file(&path) {
                 eprintln!("File not ready: {} ({error})", path.display());
                 emit_status(&app, "idle", Some(&path), Some(error), None);
+                completed += 1;
+                total_elapsed += start.elapsed();
+                let average = total_elapsed.as_secs_f64() / completed as f64;
+                let remaining = total.saturating_sub(completed) as f64;
+                emit_batch_progress(
+                    &app,
+                    BatchProgress {
+                        total,
+                        completed,
+                        percent: (completed as f64 / total as f64) * 100.0,
+                        eta_seconds: (average * remaining).round() as u64,
+                        in_progress: completed < total,
+                    },
+                );
                 continue;
             }
 
@@ -326,6 +446,21 @@ fn process_existing_screenshots(app: AppHandle, paths: Vec<PathBuf>) {
                     emit_status(&app, "idle", Some(&path), Some(error), None);
                 }
             }
+
+            completed += 1;
+            total_elapsed += start.elapsed();
+            let average = total_elapsed.as_secs_f64() / completed as f64;
+            let remaining = total.saturating_sub(completed) as f64;
+            emit_batch_progress(
+                &app,
+                BatchProgress {
+                    total,
+                    completed,
+                    percent: (completed as f64 / total as f64) * 100.0,
+                    eta_seconds: (average * remaining).round() as u64,
+                    in_progress: completed < total,
+                },
+            );
         }
     });
 }
@@ -394,8 +529,25 @@ fn delete_files(paths: Vec<String>) -> Result<DeleteResult, String> {
 
     for path_str in paths {
         let path = PathBuf::from(&path_str);
+        
+        // Check if file exists first
+        if !path.exists() {
+            // File doesn't exist - treat as successful deletion (remove from index)
+            deleted.push(path_str);
+            continue;
+        }
+        
         let Ok(canonical_path) = fs::canonicalize(&path) else {
-            failed.push(path_str);
+            // Can't canonicalize but file exists - try direct deletion
+            match fs::remove_file(&path) {
+                Ok(_) => {
+                    deleted.push(path_str);
+                }
+                Err(e) => {
+                    eprintln!("[DELETE] Failed to delete {} (canonicalize failed): {:?}", path_str, e);
+                    failed.push(path_str);
+                }
+            }
             continue;
         };
 
@@ -406,20 +558,20 @@ fn delete_files(paths: Vec<String>) -> Result<DeleteResult, String> {
         });
 
         if !allowed {
+            eprintln!("[DELETE] Path not in allowed directories: {}", path_str);
             failed.push(path_str);
             continue;
         }
 
         match fs::remove_file(&canonical_path) {
             Ok(_) => {
-                deleted.push(
-                    canonical_path
-                        .to_str()
-                        .unwrap_or(&path_str)
-                        .to_string(),
-                );
+                // Return the original path_str, not canonicalized, so it matches frontend entries
+                deleted.push(path_str);
             }
-            Err(_) => failed.push(path_str),
+            Err(e) => {
+                eprintln!("[DELETE] Failed to delete {}: {:?}", path_str, e);
+                failed.push(path_str);
+            }
         }
     }
 
