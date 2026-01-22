@@ -9,10 +9,12 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, webview::WebviewWindowBuilder, utils::config::WebviewUrl};
+use tauri_plugin_global_shortcut::{Code, Modifiers, ShortcutState, GlobalShortcutExt};
 use tesseract::Tesseract;
 use image::{ImageBuffer, GenericImageView};
 use regex::Regex;
+use image_hasher::{HashAlg, HasherConfig};
 
 #[derive(Clone, Serialize)]
 struct OcrStatus {
@@ -21,6 +23,9 @@ struct OcrStatus {
     error: Option<String>,
     text: Option<String>,
     created_at: Option<String>,
+    tags: Option<String>,
+    urls: Option<String>,
+    emails: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -78,12 +83,28 @@ fn emit_status(
 ) {
     let created_at = path.and_then(|p| get_file_created_at(p));
     
+    // Extract tags, URLs, emails if text is available
+    let (tags, urls, emails) = if let Some(text_str) = &text {
+        let detected_tags = detect_collections(text_str);
+        let (extracted_urls, extracted_emails) = extract_urls_and_emails(text_str);
+        (
+            Some(serde_json::to_string(&detected_tags).unwrap_or_else(|_| "[]".to_string())),
+            Some(serde_json::to_string(&extracted_urls).unwrap_or_else(|_| "[]".to_string())),
+            Some(serde_json::to_string(&extracted_emails).unwrap_or_else(|_| "[]".to_string()))
+        )
+    } else {
+        (None, None, None)
+    };
+    
     let payload = OcrStatus {
         status: status.to_string(),
         path: path.and_then(|value| value.to_str()).map(|value| value.to_string()),
         error,
         text,
         created_at,
+        tags,
+        urls,
+        emails,
     };
 
     if let Err(error) = app.emit("ocr-status", payload) {
@@ -375,6 +396,354 @@ fn fix_ocr_character_mistakes(text: &str) -> String {
     }).to_string();
     
     fixed
+}
+
+// Auto-tagging functions
+// Follows strict priority order: Messages → Code → Design → Receipts → Browser → Terminal → Errors → Documents → Images
+fn detect_collections(text: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    let text_lower = text.to_lowercase();
+    let text_trimmed = text.trim();
+    let word_count = text_trimmed.split_whitespace().count();
+    let char_count = text_trimmed.len();
+    
+    // Debug: Log what we're detecting
+    let debug = word_count > 0 && word_count < 100; // Only debug shorter texts to avoid spam
+    
+    // STEP 1: MESSAGES DETECTION (Highest Priority - Check FIRST)
+    // Time patterns (various formats) - be more lenient
+    let time_pattern_12h = Regex::new(r"\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)").unwrap();
+    let time_pattern_24h = Regex::new(r"\b\d{1,2}:\d{2}\b").unwrap();
+    let has_timestamps_12h = time_pattern_12h.find_iter(text).count() >= 1;
+    let has_timestamps_24h = time_pattern_24h.find_iter(text).count() >= 1; // Even one timestamp suggests messages
+    let has_any_timestamp = has_timestamps_12h || has_timestamps_24h;
+    
+    // Message app names and UI elements
+    let has_message_apps = ["imessage", "slack", "discord", "whatsapp", "telegram", "signal", 
+                            "messenger", "facebook messenger", "group chat", "direct message",
+                            "dm", "thread", "channel", "conversation", "chat"].iter()
+                            .any(|app| text_lower.contains(app));
+    
+    // Read receipts and message status
+    let has_read_receipts = text_lower.contains("read") || text_lower.contains("delivered") ||
+                           text_lower.contains("sent") || text_lower.contains("seen") ||
+                           text_lower.contains("typing") || text_lower.contains("online") ||
+                           text_lower.contains("offline") || text_lower.contains("last seen");
+    
+    // Chat/messaging words and patterns (expanded list)
+    let has_chat_words = ["lmao", "lol", "omg", "btw", "imo", "tbh", "haha", "hahaha", 
+                          "lmaoo", "lmfao", "fr", "ngl", "wyd", "wbu", "ttyl", "brb",
+                          "thanks", "thank you", "np", "yw", "gg", "gl", "hf", "ikr",
+                          "smh", "fyi", "asap", "tbh", "imo", "idk", "ik", "yeah", "yep",
+                          "nah", "nope", "sure", "ok", "okay", "k", "kk", "got it",
+                          "sounds good", "cool", "nice", "awesome", "perfect"].iter()
+                          .any(|word| text_lower.contains(word));
+    
+    // Conversational patterns (questions, casual language)
+    let has_questions = text.matches('?').count() >= 1; // Even one question suggests conversation
+    let has_casual_greetings = ["hey", "hi", "hello", "sup", "what's up", "how are you", 
+                                "how's it going", "what's going on", "how's everything",
+                                "how have you been", "long time", "miss you"].iter()
+                                .any(|greeting| text_lower.contains(greeting));
+    
+    // MESSAGE BUBBLES DETECTION (primary indicator)
+    // Message bubbles have distinct patterns:
+    // - Multiple short conversational lines
+    // - Often have names/contacts before messages
+    // - Often have timestamps on each line or message
+    // - Lines are typically short (under 100 chars) and conversational
+    // - Multiple messages from different "senders" (even if same person)
+    let lines: Vec<&str> = text.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    
+    // Count short conversational lines (typical message bubble length)
+    let short_lines = lines.iter().filter(|line| {
+        let len = line.len();
+        len > 0 && len < 120 // Message bubbles are typically short
+    }).count();
+    
+    // Check for name patterns before messages (common in chat apps)
+    // Patterns like "John:", "Sarah:", "You:", "Me:", or contact names
+    let name_pattern = Regex::new(r"^[A-Z][a-z]+:|\b(You|Me|I):").unwrap();
+    let has_name_prefixes = lines.iter().filter(|line| name_pattern.is_match(line)).count();
+    
+    // Check for timestamp patterns on lines (common in message bubbles)
+    let line_with_time = Regex::new(r"\d{1,2}:\d{2}").unwrap();
+    let lines_with_timestamps = lines.iter().filter(|line| line_with_time.is_match(line)).count();
+    
+    // Check for conversational structure (multiple short messages)
+    // Message bubbles typically have 3+ short lines OR 2+ with strong indicators
+    let has_multiple_short_messages = short_lines >= 3;
+    
+    // Check for alternating patterns (like back-and-forth conversation)
+    // Even if it's the same person, messages appear as separate bubbles
+    let _has_conversation_structure = short_lines >= 2 && 
+                                    (has_name_prefixes >= 1 || lines_with_timestamps >= 1);
+    
+    // Strong message bubble indicators - this is the PRIMARY indicator
+    // If we detect message bubbles, it's almost certainly a message screenshot
+    let has_message_bubbles = has_multiple_short_messages || // 3+ short lines
+                             (short_lines >= 2 && has_name_prefixes >= 1) || // 2+ short lines with name prefixes
+                             (short_lines >= 2 && lines_with_timestamps >= 1) || // 2+ short lines with timestamps
+                             (has_name_prefixes >= 2) || // Multiple name prefixes (strong indicator)
+                             (lines_with_timestamps >= 2 && short_lines >= 1); // Multiple timestamps (strong indicator)
+    
+    // Date headers in messages (Today, Yesterday, etc.)
+    let has_date_headers = ["today", "yesterday", "just now", "this week", "this month",
+                            "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"].iter()
+                          .any(|date| text_lower.contains(date));
+    
+    // Contact names or phone numbers (common in messages)
+    let phone_pattern = Regex::new(r"\+?\d{1,3}[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}").unwrap();
+    let _has_phone = phone_pattern.is_match(text);
+    
+    // Conversational indicators (back-and-forth patterns)
+    let has_conversation_indicators = text.matches(":").count() > 2 && // Multiple colons suggest timestamps or names
+                                    (text.matches("\n").count() > 1 || short_lines > 1);
+    
+    // Emoji patterns (common in messages)
+    let has_emoji_like = text.contains(":)") || text.contains(":(") || text.contains(":D") ||
+                        text.contains("<3") || text.contains(":P") || text.contains(";)");
+    
+    // STEP 1: MESSAGES DETECTION (Highest Priority)
+    // MESSAGE BUBBLES ARE THE PRIMARY INDICATOR - Check this FIRST
+    if has_message_bubbles {
+        tags.push("Messages".to_string());
+        if debug {
+            println!("[TAG] ✅ Tagged as Messages (bubbles detected): {} short lines, {} name prefixes, {} timestamps", 
+                     short_lines, has_name_prefixes, lines_with_timestamps);
+        }
+        return tags; // Stop here - Messages takes priority
+    } else if has_any_timestamp || 
+       has_message_apps || 
+       has_read_receipts ||
+       (has_chat_words && (has_questions || has_conversation_indicators)) ||
+       (has_questions && has_casual_greetings) ||
+       (has_date_headers && has_any_timestamp) ||
+       (has_emoji_like && has_questions) {
+        tags.push("Messages".to_string());
+        if debug {
+            println!("[TAG] ✅ Tagged as Messages (secondary indicators)");
+        }
+        return tags; // Stop here - Messages takes priority
+    }
+    
+    // STEP 2: CODE DETECTION (Only if not Messages)
+    let code_keywords = ["function", "const", "let", "var", "class", "import", "export", "def", "return", "async", "await", "fn", "impl", "struct"];
+    let code_symbols = ["{", "}", "=>", "->", "::", "()"];
+    let has_code_keywords = code_keywords.iter().any(|kw| text_lower.contains(kw));
+    let has_code_symbols = code_symbols.iter().any(|sym| text.contains(sym));
+    let has_indentation = Regex::new(r"(?m)^    ").unwrap().is_match(text);
+    let has_comments = text.contains("//") || text.contains("/*") || text.contains("#");
+    
+    if has_code_keywords && (has_code_symbols || has_indentation || has_comments) {
+        tags.push("Code".to_string());
+        if debug {
+            println!("[TAG] ✅ Tagged as Code");
+        }
+        return tags; // Stop here
+    }
+    
+    // STEP 3: DESIGN DETECTION
+    let hex_pattern = Regex::new(r"#[0-9A-Fa-f]{6}").unwrap();
+    let has_colors = hex_pattern.find_iter(text).count() > 0;
+    let has_design_tools = ["figma", "sketch", "adobe", "photoshop", "illustrator"].iter().any(|tool| text_lower.contains(tool));
+    let has_design_terms = ["px", "rem", "font", "color", "background", "border", "padding", "margin"].iter().any(|term| text_lower.contains(term));
+    
+    if has_colors || has_design_tools || (has_design_terms && text_lower.contains("design")) {
+        tags.push("Design".to_string());
+        if debug {
+            println!("[TAG] ✅ Tagged as Design");
+        }
+        return tags; // Stop here
+    }
+    
+    // STEP 4: RECEIPTS DETECTION
+    let price_pattern = Regex::new(r"\$\d+\.\d{2}").unwrap();
+    let has_prices = price_pattern.find_iter(text).count() > 0;
+    let has_receipt_words = ["total", "subtotal", "tax", "receipt", "invoice", "paid", "order"].iter().any(|word| text_lower.contains(word));
+    let date_pattern = Regex::new(r"\d{1,2}/\d{1,2}/\d{2,4}").unwrap();
+    let has_dates = date_pattern.is_match(text);
+    
+    if has_prices && (has_receipt_words || has_dates) {
+        tags.push("Receipts".to_string());
+        if debug {
+            println!("[TAG] ✅ Tagged as Receipts");
+        }
+        return tags; // Stop here
+    }
+    
+    // STEP 5: BROWSER DETECTION
+    let url_pattern = Regex::new(r"https?://[^\s]+").unwrap();
+    let has_urls = url_pattern.find_iter(text).count() > 0;
+    let has_www = text.contains("www.") || text.contains("http");
+    
+    // Browser UI elements
+    let browser_ui = ["address bar", "bookmarks", "back", "forward", "refresh", "home", 
+                      "chrome", "safari", "firefox", "edge", "brave", "opera",
+                      "new tab", "close tab", "search", "omnibox", "url bar"];
+    let has_browser_ui = browser_ui.iter().any(|ui| text_lower.contains(ui));
+    
+    // Navigation elements
+    let has_nav_elements = text.contains("←") || text.contains("→") || 
+                          text.contains("↻") || text.contains("⌂") ||
+                          text_lower.contains("navigation") || text_lower.contains("menu");
+    
+    // Domain patterns (e.g., "google.com", "github.com")
+    let domain_pattern = Regex::new(r"\b[a-z0-9-]+\.[a-z]{2,}\b").unwrap();
+    let has_domains = domain_pattern.find_iter(&text_lower).count() > 2;
+    
+    // Check for browser-specific patterns
+    let has_browser_patterns = text_lower.contains("://") || 
+                              (has_urls && text.split_whitespace().count() > 20) ||
+                              (has_domains && has_urls);
+    
+    if has_urls || has_www || has_browser_ui || has_nav_elements || has_browser_patterns {
+        tags.push("Browser".to_string());
+    }
+    
+    // TERMINAL DETECTION
+    let has_prompts = text.contains("$ ") || text.contains("~ ") || text.contains("> ");
+    let has_commands = ["cd ", "ls ", "git ", "npm ", "cargo ", "python ", "node "].iter().any(|cmd| text.contains(cmd));
+    
+    if has_prompts || has_commands {
+        tags.push("Terminal".to_string());
+        if debug {
+            println!("[TAG] ✅ Tagged as Terminal");
+        }
+        return tags; // Stop here
+    }
+    
+    // STEP 7: ERROR DETECTION
+    let error_words = ["error", "exception", "failed", "panic", "segfault", "undefined", "traceback", "stack trace"];
+    let has_errors = error_words.iter().any(|word| text_lower.contains(word));
+    let has_stack_trace = (text.contains("at ") && text.contains(".js:")) || text.contains("Traceback");
+    
+    if has_errors || has_stack_trace {
+        tags.push("Errors".to_string());
+    }
+    
+    // STEP 8: DOCUMENTS DETECTION (Only if NOT Messages and no other tags)
+    // IMPORTANT: Double-check that this is NOT a message
+    let is_likely_message = has_any_timestamp || has_message_apps || has_read_receipts || 
+                           has_chat_words || has_message_bubbles || has_date_headers ||
+                           has_questions || has_casual_greetings;
+    
+    // Only proceed with Documents if we're confident it's NOT a message and no other tags
+    if !is_likely_message && tags.is_empty() {
+        let word_count = text.split_whitespace().count();
+        let has_paragraphs = text.split("\n\n").count() > 2 || text.matches("\n").count() > 5;
+        let has_sentences = text.matches('.').count() > 3 || text.matches('!').count() > 1 || text.matches('?').count() > 1;
+        
+        // Document-like patterns (formal writing)
+        let document_patterns = ["chapter", "section", "paragraph", "article", "document", 
+                                 "page", "heading", "title", "author", "date", "published",
+                                 "abstract", "introduction", "conclusion", "references",
+                                 "table of contents", "bibliography"];
+        let has_doc_patterns = document_patterns.iter().any(|pattern| text_lower.contains(pattern));
+        
+        // Check for structured formatting (lists, numbered items)
+        let numbered_list_pattern = Regex::new(r"(?m)^\d+\.\s").unwrap();
+        let has_lists = text.contains("•") || text.contains("- ") || 
+                       numbered_list_pattern.is_match(text) ||
+                       text.matches("\n- ").count() > 2 || text.matches("\n• ").count() > 2;
+        
+        // Formal writing indicators (not casual/conversational)
+        let has_formal_language = text_lower.contains("therefore") || text_lower.contains("however") ||
+                                 text_lower.contains("furthermore") || text_lower.contains("moreover") ||
+                                 text_lower.contains("in conclusion") || text_lower.contains("in summary");
+        
+        // Plain text document indicators - must be substantial AND structured
+        let is_plain_text = word_count > 50 && // More words than typical messages
+                           (has_paragraphs || has_sentences) && 
+                           !has_urls && // Not a browser screenshot
+                           !has_code_keywords && // Not code
+                           !has_prompts && // Not terminal
+                           (has_doc_patterns || has_lists || has_formal_language); // Must have document structure
+        
+        // If it looks like a document, add Documents tag
+        if is_plain_text || (word_count > 100 && (has_doc_patterns || has_lists) && !has_questions) {
+            tags.push("Documents".to_string());
+            if debug {
+                println!("[TAG] ✅ Tagged as Documents");
+            }
+            return tags; // Stop here
+        }
+    }
+    
+    // STEP 9: IMAGES/PHOTOS DETECTION (Fallback - very little or no text)
+    // Check if this is primarily an image with minimal text
+    let has_minimal_text = char_count < 50 || word_count < 10;
+    
+    // Image metadata or UI overlay text (short, non-descriptive)
+    let is_ui_overlay = word_count < 20 && 
+                       (text_lower.contains("screenshot") || 
+                        text_lower.contains("image") ||
+                        text_lower.contains("photo") ||
+                        text_lower.contains("picture") ||
+                        text_lower.contains("camera") ||
+                        text_lower.contains("gallery") ||
+                        text_lower.contains("album") ||
+                        text_lower.contains("instagram") ||
+                        text_lower.contains("snapchat") ||
+                        text_lower.contains("filters"));
+    
+    // Random characters or OCR noise (not meaningful text)
+    let is_ocr_noise = char_count > 0 && char_count < 30 && 
+                      (text_trimmed.chars().filter(|c| c.is_alphanumeric()).count() < 15 ||
+                       text_trimmed.matches(char::is_uppercase).count() > char_count / 2);
+    
+    // If there's very little text and no other meaningful tags, it's likely an image
+    // Only tag as "Images" if we have some text (OCR picked up something) but it's minimal
+    // OR if it's just UI overlay text
+    if (has_minimal_text && tags.is_empty() && text_trimmed.len() > 0) || 
+       (is_ui_overlay && tags.is_empty()) ||
+       (is_ocr_noise && tags.is_empty()) {
+        tags.push("Images".to_string());
+        if debug {
+            println!("[TAG] ✅ Tagged as Images (minimal text)");
+        }
+    }
+    
+    if debug && tags.is_empty() {
+        println!("[TAG] ⚠️ No tags detected for text ({} words, {} chars)", word_count, char_count);
+    }
+    
+    tags
+}
+
+fn extract_urls_and_emails(text: &str) -> (Vec<String>, Vec<String>) {
+    let url_pattern = Regex::new(r"https?://[^\s]+").unwrap();
+    let email_pattern = Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b").unwrap();
+    
+    let urls: Vec<String> = url_pattern.find_iter(text)
+        .map(|m| m.as_str().to_string())
+        .collect();
+    
+    let emails: Vec<String> = email_pattern.find_iter(text)
+        .map(|m| m.as_str().to_string())
+        .collect();
+    
+    (urls, emails)
+}
+
+fn compute_perceptual_hash(path: &Path) -> Result<Vec<u8>, String> {
+    let img = image::open(path)
+        .map_err(|e| format!("Failed to open image: {}", e))?;
+    
+    let hasher = HasherConfig::new()
+        .hash_alg(HashAlg::Gradient)
+        .hash_size(16, 16)
+        .to_hasher();
+    
+    let hash = hasher.hash_image(&img);
+    Ok(hash.as_bytes().to_vec())
+}
+
+fn hamming_distance(hash1: &[u8], hash2: &[u8]) -> u32 {
+    hash1.iter()
+        .zip(hash2.iter())
+        .map(|(a, b)| (a ^ b).count_ones())
+        .sum()
 }
 
 fn clean_ocr_text(text: &str) -> String {
@@ -766,8 +1135,11 @@ fn run_ocr(path: &Path) -> Result<String, String> {
     // COMBINE RESULTS FROM BOTH ENGINES
     let raw_combined = combine_ocr_results(vision_result, tesseract_result);
     
+    // If both engines failed or returned empty, return empty string instead of error
+    // This allows screenshots without text to still be saved and displayed
     if raw_combined.is_empty() {
-        return Err("Both OCR engines failed or returned empty results".to_string());
+        println!("[OCR] ⚠️ Both OCR engines failed or returned empty results - saving with empty text");
+        return Ok(String::new());
     }
     
     println!("[OCR] Raw combined text: {} chars", raw_combined.len());
@@ -1029,10 +1401,35 @@ fn init_database(app: &AppHandle) -> SqlResult<Connection> {
             text TEXT NOT NULL,
             created_at TEXT NOT NULL,
             processed_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            tags TEXT,
+            urls TEXT,
+            emails TEXT,
+            perceptual_hash BLOB
         )",
         [],
     )?;
+    
+    // Add new columns if they don't exist (for existing databases)
+    let columns_to_add = vec![
+        ("tags", "TEXT"),
+        ("urls", "TEXT"),
+        ("emails", "TEXT"),
+        ("perceptual_hash", "BLOB"),
+    ];
+    
+    for (col_name, col_type) in columns_to_add {
+        let check_sql = format!("SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name='{}'", col_name);
+        let count: i64 = conn.query_row(&check_sql, [], |row| row.get(0)).unwrap_or(0);
+        if count == 0 {
+            let alter_sql = format!("ALTER TABLE entries ADD COLUMN {} {}", col_name, col_type);
+            if let Err(e) = conn.execute(&alter_sql, []) {
+                eprintln!("[DB] Warning: Failed to add column {}: {}", col_name, e);
+            } else {
+                println!("[DB] Added column: {}", col_name);
+            }
+        }
+    }
     
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_path ON entries(path)",
@@ -1043,6 +1440,19 @@ fn init_database(app: &AppHandle) -> SqlResult<Connection> {
         "CREATE INDEX IF NOT EXISTS idx_created_at ON entries(created_at)",
         [],
     )?;
+    
+    // Only create index on tags if the column exists
+    let tags_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name='tags'",
+        [],
+        |row| row.get(0)
+    ).unwrap_or(0);
+    
+    if tags_exists > 0 {
+        if let Err(e) = conn.execute("CREATE INDEX IF NOT EXISTS idx_tags ON entries(tags)", []) {
+            eprintln!("[DB] Warning: Failed to create tags index: {}", e);
+        }
+    }
     
     println!("[DB] Database initialized at: {}", db_path.display());
     Ok(conn)
@@ -1056,13 +1466,42 @@ fn save_entry_to_db(app: &AppHandle, path: &str, text: &str, created_at: &str) -
         .as_secs();
     let now_str = now.to_string();
     
+    // Auto-detect tags
+    // If text is empty or very minimal, it's likely an image/photo
+    let tags = if text.trim().is_empty() || text.trim().len() < 10 {
+        vec!["Images".to_string()]
+    } else {
+        detect_collections(text)
+    };
+    let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
+    
+    // Extract URLs and emails
+    let (urls, emails) = extract_urls_and_emails(text);
+    let urls_json = serde_json::to_string(&urls).unwrap_or_else(|_| "[]".to_string());
+    let emails_json = serde_json::to_string(&emails).unwrap_or_else(|_| "[]".to_string());
+    
+    // Compute perceptual hash for similarity detection
+    let perceptual_hash = compute_perceptual_hash(Path::new(path)).ok();
+    
     conn.execute(
-        "INSERT OR REPLACE INTO entries (path, text, created_at, processed_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![path, text, created_at, now_str, now_str],
+        "INSERT OR REPLACE INTO entries (path, text, created_at, processed_at, updated_at, tags, urls, emails, perceptual_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![path, text, created_at, now_str, now_str, tags_json, urls_json, emails_json, perceptual_hash],
     )?;
     
-    println!("[DB] ✅ Saved entry: {} ({} chars)", path, text.len());
+    if !tags.is_empty() {
+        println!("[DB] ✅ Saved entry: {} ({} chars) - Tags: {:?}", path, text.len(), tags);
+    } else {
+        println!("[DB] ✅ Saved entry: {} ({} chars)", path, text.len());
+    }
+    
+    if !urls.is_empty() {
+        println!("[DB]   Found {} URLs: {:?}", urls.len(), urls);
+    }
+    if !emails.is_empty() {
+        println!("[DB]   Found {} emails: {:?}", emails.len(), emails);
+    }
+    
     Ok(())
 }
 
@@ -1071,16 +1510,22 @@ struct DbEntry {
     path: String,
     text: String,
     at: String,
+    tags: Option<String>,
+    urls: Option<String>,
+    emails: Option<String>,
 }
 
 fn load_all_entries_from_db(app: &AppHandle) -> SqlResult<Vec<DbEntry>> {
     let conn = init_database(app)?;
-    let mut stmt = conn.prepare("SELECT path, text, created_at FROM entries ORDER BY created_at DESC")?;
+    let mut stmt = conn.prepare("SELECT path, text, created_at, tags, urls, emails FROM entries ORDER BY created_at DESC")?;
     let rows = stmt.query_map([], |row| {
         Ok(DbEntry {
             path: row.get(0)?,
             text: row.get(1)?,
             at: row.get(2)?,
+            tags: row.get(3).ok(),
+            urls: row.get(4).ok(),
+            emails: row.get(5).ok(),
         })
     })?;
     
@@ -1191,8 +1636,8 @@ fn process_screenshot(
             };
             remember_ignore(&ignore_map, &path);
             
-            // Save to database
-            let created_at = get_file_created_at(&final_path)
+            // Get creation date from ORIGINAL path (before rename) - this is what we'll match against on startup
+            let created_at = get_file_created_at(&path)
                 .unwrap_or_else(|| {
                     SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -1200,6 +1645,8 @@ fn process_screenshot(
                         .as_secs()
                         .to_string()
                 });
+            
+            // Save to database with final_path (renamed path) but original creation date
             if let Err(e) = save_entry_to_db(&app, &final_path.to_string_lossy(), &trimmed, &created_at) {
                 eprintln!("[DB] ⚠️ Failed to save entry to database: {}", e);
             }
@@ -1211,6 +1658,25 @@ fn process_screenshot(
         Err(error) => {
             eprintln!("[OCR] ❌ OCR failed for {}: {error}", path.display());
             eprintln!("[OCR] Error details: {}", error);
+            
+            // Still save the entry to database even if OCR failed
+            // This allows the screenshot to appear in the UI, even without text
+            let created_at = get_file_created_at(&path)
+                .unwrap_or_else(|| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        .to_string()
+                });
+            
+            // Save with empty text - user can still see the image
+            if let Err(e) = save_entry_to_db(&app, &path.to_string_lossy(), "", &created_at) {
+                eprintln!("[DB] ⚠️ Failed to save entry to database after OCR failure: {}", e);
+            } else {
+                println!("[DB] ✅ Saved entry (no OCR text) to database: {}", path.display());
+            }
+            
             emit_status(&app, "idle", Some(&path), Some(error), None);
         }
     }
@@ -1364,6 +1830,21 @@ fn process_existing_screenshots(app: AppHandle, paths: Vec<PathBuf>) {
                             char_count, word_count, path.display());
                     }
                     
+                    // Get creation date from original path (before any potential rename)
+                    let created_at = get_file_created_at(&path)
+                        .unwrap_or_else(|| {
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs()
+                                .to_string()
+                        });
+                    
+                    // Save to database (using original path since process_existing_screenshots doesn't rename)
+                    if let Err(e) = save_entry_to_db(&app, &path.to_string_lossy(), &trimmed, &created_at) {
+                        eprintln!("[DB] ⚠️ Failed to save entry to database: {}", e);
+                    }
+                    
                     // Always emit the text, even if empty
                     emit_status(&app, "idle", Some(&path), None, Some(trimmed));
                 }
@@ -1414,13 +1895,89 @@ fn start_watcher(app: AppHandle) {
         }
 
         let existing = load_existing_screenshots(&watch_dirs);
+        
+        // Check database to see which screenshots are already indexed
+        // Since files get renamed, we match by creation date (most reliable)
+        let mut already_indexed_dates = HashSet::new();
+        let db_entry_count = if let Ok(db_entries) = load_all_entries_from_db(&app) {
+            let count = db_entries.len();
+            for entry in db_entries {
+                // Parse creation date from database (stored as milliseconds timestamp string)
+                if let Ok(created_timestamp) = entry.at.parse::<u64>() {
+                    // Round to nearest second for matching tolerance
+                    // This handles small timestamp differences
+                    let rounded = (created_timestamp / 1000) * 1000;
+                    already_indexed_dates.insert(rounded);
+                }
+            }
+            count
+        } else {
+            0
+        };
+        
+        println!("[WATCHER] Found {} entries in database, checking {} existing screenshots", 
+            db_entry_count, existing.len());
+        
+        // Only process screenshots that aren't already in the database
+        let mut skipped = 0;
+        let to_process: Vec<PathBuf> = existing.iter()
+            .filter(|path| {
+                // Get file creation date
+                let Some(created_at_str) = get_file_created_at(path) else {
+                    // Can't get creation date, process it to be safe
+                    return true;
+                };
+                
+                let Ok(created_timestamp) = created_at_str.parse::<u64>() else {
+                    // Can't parse timestamp, process it
+                    return true;
+                };
+                
+                // Round to nearest second for matching (same as database)
+                let rounded = (created_timestamp / 1000) * 1000;
+                
+                // Check if this creation date is already indexed
+                if already_indexed_dates.contains(&rounded) {
+                    skipped += 1;
+                    println!("[WATCHER] ✅ Skipping {} - already indexed (creation date: {})", 
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown"),
+                        created_timestamp);
+                    return false;
+                }
+                
+                true // Not indexed, process it
+            })
+            .cloned()
+            .collect();
+        
+        println!("[WATCHER] Skipping {} already indexed, processing {} new screenshots", skipped, to_process.len());
+        
         {
             let mut guard = known_map.lock().unwrap();
+            // Mark all existing screenshots as known (whether we process them or not)
             for path in &existing {
                 guard.insert(path.clone());
             }
         }
-        process_existing_screenshots(app.clone(), existing);
+        
+        if !to_process.is_empty() {
+            println!("[WATCHER] Processing {} new screenshots (skipping {} already indexed)", 
+                to_process.len(), existing.len() - to_process.len());
+            process_existing_screenshots(app.clone(), to_process);
+        } else {
+            println!("[WATCHER] All {} existing screenshots already indexed, skipping processing", existing.len());
+            // Emit batch progress to indicate we're done
+            emit_batch_progress(
+                &app,
+                BatchProgress {
+                    total: 0,
+                    completed: 0,
+                    percent: 100.0,
+                    eta_seconds: 0,
+                    in_progress: false,
+                },
+            );
+        }
 
         for dir in watch_dirs {
             if let Err(error) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
@@ -1555,21 +2112,232 @@ fn load_all_entries(app: AppHandle) -> Result<Vec<DbEntry>, String> {
         .map_err(|e| format!("Failed to load entries: {}", e))
 }
 
+#[tauri::command]
+fn find_similar_screenshots(app: AppHandle, threshold: Option<u32>) -> Result<Vec<Vec<String>>, String> {
+    let conn = init_database(&app)
+        .map_err(|e| format!("DB error: {}", e))?;
+    
+    let mut stmt = conn.prepare("SELECT path, perceptual_hash FROM entries WHERE perceptual_hash IS NOT NULL")
+        .map_err(|e| format!("Query error: {}", e))?;
+    
+    let entries: Vec<(String, Vec<u8>)> = stmt.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })
+    .map_err(|e| format!("Query map error: {}", e))?
+    .filter_map(|r| r.ok())
+    .collect();
+    
+    let threshold = threshold.unwrap_or(10); // Default threshold
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    let mut assigned = vec![false; entries.len()];
+    
+    for i in 0..entries.len() {
+        if assigned[i] {
+            continue;
+        }
+        
+        let mut group = vec![i];
+        assigned[i] = true;
+        
+        for j in (i + 1)..entries.len() {
+            if assigned[j] {
+                continue;
+            }
+            
+            let distance = hamming_distance(&entries[i].1, &entries[j].1);
+            if distance <= threshold {
+                group.push(j);
+                assigned[j] = true;
+            }
+        }
+        
+        if group.len() > 1 {
+            groups.push(group.into_iter().map(|idx| entries[idx].0.clone()).collect());
+        }
+    }
+    
+    println!("[SIMILARITY] Found {} groups of similar screenshots", groups.len());
+    Ok(groups)
+}
+
+#[tauri::command]
+fn open_quick_search(app: AppHandle) -> Result<(), String> {
+    // Check if quick search window already exists
+    if let Some(window) = app.get_webview_window("quick-search") {
+        window.show().map_err(|e| format!("Failed to show window: {}", e))?;
+        window.set_focus().map_err(|e| format!("Failed to focus window: {}", e))?;
+        return Ok(());
+    }
+    
+    // Create new quick search window
+    // Use dev URL in development, app URL in production
+    #[cfg(debug_assertions)]
+    let url = WebviewUrl::External("http://localhost:1420/quick-search.html".parse().map_err(|e| format!("Invalid URL: {}", e))?);
+    #[cfg(not(debug_assertions))]
+    let url = WebviewUrl::App("quick-search.html".into());
+    
+    let window = WebviewWindowBuilder::new(
+        &app,
+        "quick-search",
+        url
+    )
+    .title("Quick Search")
+    .inner_size(600.0, 500.0)
+    .resizable(false)
+    .decorations(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .build()
+    .map_err(|e| format!("Failed to create window: {}", e))?;
+    
+    // Center the window on screen
+    if let Err(e) = window.center() {
+        eprintln!("Failed to center window: {}", e);
+    }
+    
+    window.show().map_err(|e| format!("Failed to show window: {}", e))?;
+    window.set_focus().map_err(|e| format!("Failed to focus window: {}", e))?;
+    
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    if event.state == ShortcutState::Pressed {
+                        // Check if it's Cmd+Shift+F (or Ctrl+Shift+F on Windows/Linux)
+                        #[cfg(target_os = "macos")]
+                        let is_cmd_shift_f = shortcut.matches(Modifiers::META | Modifiers::SHIFT, Code::KeyF);
+                        #[cfg(not(target_os = "macos"))]
+                        let is_cmd_shift_f = shortcut.matches(Modifiers::CONTROL | Modifiers::SHIFT, Code::KeyF);
+                        
+                        if is_cmd_shift_f {
+                            let app_handle = app.app_handle().clone();
+                            if let Err(e) = open_quick_search(app_handle) {
+                                eprintln!("Failed to open quick search: {}", e);
+                            }
+                        }
+                    }
+                })
+                .build()
+        )
         .invoke_handler(tauri::generate_handler![
             delete_files,
             copy_image_to_clipboard,
-            load_all_entries
+            load_all_entries,
+            find_similar_screenshots,
+            open_quick_search,
+            reprocess_all_tags,
+            compute_missing_hashes
         ])
         .setup(|app| {
             // Verify Tesseract on startup
             verify_tesseract();
-            start_watcher(app.handle().clone());
+            start_watcher(app.app_handle().clone());
+            
+            // Register the global shortcut
+            let app_handle = app.app_handle().clone();
+            match app_handle.global_shortcut().register("CommandOrControl+Shift+F") {
+                Ok(_) => println!("[SHORTCUT] ✅ Registered Cmd+Shift+F for quick search"),
+                Err(e) => eprintln!("[SHORTCUT] ❌ Failed to register global shortcut: {}", e),
+            }
+            
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[tauri::command]
+fn reprocess_all_tags(app: AppHandle) -> Result<usize, String> {
+    let conn = init_database(&app)
+        .map_err(|e| format!("DB error: {}", e))?;
+    
+    // Get ALL entries to reprocess with improved detection logic
+    let mut stmt = conn.prepare("SELECT path, text FROM entries")
+        .map_err(|e| format!("Query error: {}", e))?;
+    
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }).map_err(|e| format!("Query map error: {}", e))?;
+    
+    let mut updated = 0;
+    let mut with_tags = 0;
+    let mut without_tags = 0;
+    
+    for row in rows {
+        let (path, text) = row.map_err(|e| format!("Row error: {}", e))?;
+        
+        // Detect tags from text using improved detection logic
+        let tags = detect_collections(&text);
+        let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
+        
+        // Update the entry with new tags (always update, even if tags changed)
+        if let Err(e) = conn.execute(
+            "UPDATE entries SET tags = ?1 WHERE path = ?2",
+            rusqlite::params![tags_json, path]
+        ) {
+            eprintln!("[REPROCESS] Failed to update {}: {}", path, e);
+        } else {
+            updated += 1;
+            if !tags.is_empty() {
+                with_tags += 1;
+                println!("[REPROCESS] ✅ Updated {}: {:?}", path, tags);
+            } else {
+                without_tags += 1;
+            }
+        }
+    }
+    
+    println!("[REPROCESS] ✅ Reprocessed {} entries total ({} with tags, {} without tags)", 
+             updated, with_tags, without_tags);
+    Ok(updated)
+}
+
+#[tauri::command]
+fn compute_missing_hashes(app: AppHandle) -> Result<usize, String> {
+    let conn = init_database(&app)
+        .map_err(|e| format!("DB error: {}", e))?;
+    
+    // Get all entries without perceptual hashes
+    let mut stmt = conn.prepare("SELECT path FROM entries WHERE perceptual_hash IS NULL")
+        .map_err(|e| format!("Query error: {}", e))?;
+    
+    let rows = stmt.query_map([], |row| {
+        Ok(row.get::<_, String>(0)?)
+    }).map_err(|e| format!("Query map error: {}", e))?;
+    
+    let mut computed = 0;
+    for row in rows {
+        let path_str = row.map_err(|e| format!("Row error: {}", e))?;
+        let path = Path::new(&path_str);
+        
+        // Compute perceptual hash
+        match compute_perceptual_hash(path) {
+            Ok(hash_bytes) => {
+                // Update the entry with the hash
+                if let Err(e) = conn.execute(
+                    "UPDATE entries SET perceptual_hash = ?1 WHERE path = ?2",
+                    rusqlite::params![hash_bytes, path_str]
+                ) {
+                    eprintln!("[HASH] Failed to update {}: {}", path_str, e);
+                } else {
+                    computed += 1;
+                    if computed % 10 == 0 {
+                        println!("[HASH] Computed {} hashes...", computed);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[HASH] Failed to compute hash for {}: {}", path_str, e);
+            }
+        }
+    }
+    
+    println!("[HASH] ✅ Computed {} perceptual hashes", computed);
+    Ok(computed)
 }

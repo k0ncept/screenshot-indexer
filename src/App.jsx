@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 
@@ -9,12 +9,33 @@ function App() {
   const [copySuccess, setCopySuccess] = useState(false);
   const [query, setQuery] = useState("");
   const [entries, setEntries] = useState([]);
+  const [selectedCollection, setSelectedCollection] = useState(null);
+  const [showSimilar, setShowSimilar] = useState(false);
+  const [similarGroups, setSimilarGroups] = useState([]);
   
   // Debug function - expose to window for console access
   useEffect(() => {
     window.debugChronicle = {
       getEntries: () => entries,
       getEntriesWithText: () => entries.filter(e => e.text && e.text.trim().length > 0),
+      getEntriesWithTags: () => entries.filter(e => {
+        const tags = Array.isArray(e.tags) ? e.tags : (e.tags ? JSON.parse(e.tags) : []);
+        return tags.length > 0;
+      }),
+      getTagsByCollection: (collection) => {
+        return entries.filter(e => {
+          const tags = Array.isArray(e.tags) ? e.tags : (e.tags ? JSON.parse(e.tags) : []);
+          return tags.includes(collection);
+        });
+      },
+      getAllTags: () => {
+        const allTags = new Set();
+        entries.forEach(e => {
+          const tags = Array.isArray(e.tags) ? e.tags : (e.tags ? JSON.parse(e.tags) : []);
+          tags.forEach(tag => allTags.add(tag));
+        });
+        return Array.from(allTags);
+      },
       searchInEntries: (searchTerm) => {
         const term = searchTerm.toLowerCase();
         return entries.filter(e => {
@@ -25,18 +46,22 @@ function App() {
       inspectEntry: (index) => {
         if (index >= 0 && index < entries.length) {
           const entry = entries[index];
+          const tags = Array.isArray(entry.tags) ? entry.tags : (entry.tags ? JSON.parse(entry.tags) : []);
           return {
             path: entry.path,
             text: entry.text,
             textLength: (entry.text || "").length,
             hasText: !!(entry.text && entry.text.trim().length > 0),
-            at: entry.at
+            at: entry.at,
+            tags: tags,
+            tagsCount: tags.length
           };
         }
         return null;
       }
     };
     console.log("[DEBUG] Chronicle debug functions available. Try: window.debugChronicle.getEntries()");
+    console.log("[DEBUG] Tag functions: getEntriesWithTags(), getTagsByCollection('Code'), getAllTags()");
   }, [entries]);
   const [selectedPath, setSelectedPath] = useState("");
   const [selectedPaths, setSelectedPaths] = useState([]);
@@ -163,9 +188,51 @@ function App() {
   }, []);
 
   const filteredEntries = useMemo(() => {
+    console.log("[FILTER] Starting filter - selectedCollection:", selectedCollection, "Total entries:", entries.length);
+    
+    // First filter by collection if selected
+    let collectionFiltered = entries;
+    if (selectedCollection) {
+      console.log("[FILTER] Filtering by collection:", selectedCollection);
+      collectionFiltered = entries.filter(entry => {
+        // Ensure tags is always an array
+        let tags = [];
+        try {
+          if (entry.tags) {
+            if (Array.isArray(entry.tags)) {
+              tags = entry.tags;
+            } else if (typeof entry.tags === 'string') {
+              tags = JSON.parse(entry.tags);
+            }
+          }
+        } catch (e) {
+          console.warn("[FILTER] Failed to parse tags for entry:", entry.path, e);
+        }
+        
+        const hasTag = tags.includes(selectedCollection);
+        if (hasTag) {
+          console.log("[FILTER] ✅ Entry matches:", selectedCollection, "Tags:", tags, "Path:", entry.path.split('/').pop());
+        }
+        return hasTag;
+      });
+      console.log("[FILTER] ✅ Filtered to", collectionFiltered.length, "entries for collection:", selectedCollection, "out of", entries.length, "total");
+      
+      // Debug: Show sample of entries with tags
+      const entriesWithTags = entries.filter(e => {
+        const tags = Array.isArray(e.tags) ? e.tags : (e.tags ? JSON.parse(e.tags) : []);
+        return tags.length > 0;
+      });
+      console.log("[FILTER] Entries with tags:", entriesWithTags.length, "Sample tags:", entriesWithTags.slice(0, 3).map(e => ({
+        path: e.path.split('/').pop(),
+        tags: Array.isArray(e.tags) ? e.tags : (e.tags ? JSON.parse(e.tags) : [])
+      })));
+    } else {
+      console.log("[FILTER] No collection selected, showing all entries");
+    }
+    
     const normalized = query.trim().toLowerCase();
     if (!normalized) {
-      return [...entries].sort((a, b) => {
+      return [...collectionFiltered].sort((a, b) => {
         const dateA = new Date(a.at).getTime();
         const dateB = new Date(b.at).getTime();
         return dateB - dateA;
@@ -178,7 +245,7 @@ function App() {
     console.log(`[SEARCH] Starting search for: "${normalized}" (normalized: "${normalizedQuery}")`);
     console.log(`[SEARCH] Total entries to search: ${entries.length}`);
     
-    const filtered = entries.filter((entry) => {
+    const filtered = collectionFiltered.filter((entry) => {
       // Search in path (exact substring match)
       const pathMatch = entry.path?.toLowerCase().includes(normalized) || false;
       
@@ -286,25 +353,44 @@ function App() {
       const dateB = new Date(b.at).getTime();
       return dateB - dateA;
     });
-  }, [entries, query]);
+  }, [entries, query, selectedCollection]);
 
   const groupedEntries = useMemo(() => {
     const groups = new Map();
     filteredEntries.forEach((entry) => {
-      const group = getDateGroup(entry.at);
-      if (!groups.has(group)) {
-        groups.set(group, []);
+      // Ensure entry.at is a valid date string
+      if (!entry.at) {
+        console.warn("[GROUP] Entry missing 'at' field:", entry.path);
+        return;
       }
-      groups.get(group).push(entry);
+      
+      try {
+        const group = getDateGroup(entry.at);
+        if (!groups.has(group)) {
+          groups.set(group, []);
+        }
+        groups.get(group).push(entry);
+      } catch (e) {
+        console.warn("[GROUP] Failed to group entry:", entry.path, "at:", entry.at, e);
+      }
     });
     
-    return Array.from(groups.entries())
+    const sorted = Array.from(groups.entries())
       .map(([groupName, groupEntries]) => [
         groupName,
         [...groupEntries].sort((a, b) => {
-          const dateA = new Date(a.at).getTime();
-          const dateB = new Date(b.at).getTime();
-          return dateB - dateA;
+          try {
+            const dateA = new Date(a.at).getTime();
+            const dateB = new Date(b.at).getTime();
+            if (isNaN(dateA) || isNaN(dateB)) {
+              console.warn("[GROUP] Invalid date in sort:", { a: a.at, b: b.at });
+              return 0;
+            }
+            return dateB - dateA;
+          } catch (e) {
+            console.warn("[GROUP] Sort error:", e);
+            return 0;
+          }
         }),
       ])
       .sort((a, b) => {
@@ -314,10 +400,20 @@ function App() {
         if (aIdx !== -1 && bIdx !== -1) return aIdx - bIdx;
         if (aIdx !== -1) return -1;
         if (bIdx !== -1) return 1;
-        const aDate = new Date(a[1][0]?.at || 0).getTime();
-        const bDate = new Date(b[1][0]?.at || 0).getTime();
-        return bDate - aDate;
+        try {
+          const aDate = new Date(a[1][0]?.at || 0).getTime();
+          const bDate = new Date(b[1][0]?.at || 0).getTime();
+          if (isNaN(aDate) || isNaN(bDate)) {
+            return 0;
+          }
+          return bDate - aDate;
+        } catch (e) {
+          return 0;
+        }
       });
+    
+    console.log("[GROUP] Grouped", filteredEntries.length, "entries into", sorted.length, "groups:", sorted.map(([name]) => name));
+    return sorted;
   }, [filteredEntries, getDateGroup]);
 
   const previewEntry = useMemo(() => {
@@ -470,11 +566,85 @@ function App() {
         const dbEntries = await invoke("load_all_entries");
         if (Array.isArray(dbEntries) && dbEntries.length > 0) {
           console.log("[DB] ✅ Loaded", dbEntries.length, "entries from database");
-          setEntries(dbEntries.map(entry => ({
-            path: entry.path,
-            text: entry.text || "",
-            at: entry.at || new Date().toISOString()
-          })));
+          const mappedEntries = dbEntries.map(entry => {
+            // Ensure tags, urls, emails are always arrays
+            let tags = [];
+            let urls = [];
+            let emails = [];
+            
+            try {
+              if (entry.tags) {
+                tags = typeof entry.tags === 'string' ? JSON.parse(entry.tags) : (Array.isArray(entry.tags) ? entry.tags : []);
+              }
+            } catch (e) {
+              console.warn("[DB] Failed to parse tags for entry:", entry.path, e);
+            }
+            
+            try {
+              if (entry.urls) {
+                urls = typeof entry.urls === 'string' ? JSON.parse(entry.urls) : (Array.isArray(entry.urls) ? entry.urls : []);
+              }
+            } catch (e) {
+              console.warn("[DB] Failed to parse urls for entry:", entry.path, e);
+            }
+            
+            try {
+              if (entry.emails) {
+                emails = typeof entry.emails === 'string' ? JSON.parse(entry.emails) : (Array.isArray(entry.emails) ? entry.emails : []);
+              }
+            } catch (e) {
+              console.warn("[DB] Failed to parse emails for entry:", entry.path, e);
+            }
+            
+            // Convert created_at timestamp to ISO string if it's a timestamp
+            let atValue = entry.at || new Date().toISOString();
+            // If it's a numeric timestamp string, convert it to ISO date string
+            if (typeof entry.at === 'string' && /^\d+$/.test(entry.at)) {
+              const timestamp = parseInt(entry.at, 10);
+              // Check if it's in seconds (less than year 2000 in ms) or milliseconds
+              const date = timestamp < 946684800000 
+                ? new Date(timestamp * 1000)  // seconds to milliseconds
+                : new Date(timestamp);         // already milliseconds
+              atValue = date.toISOString();
+            } else if (entry.at) {
+              // Try to parse as date, fallback to ISO string
+              const parsed = new Date(entry.at);
+              atValue = isNaN(parsed.getTime()) ? new Date().toISOString() : parsed.toISOString();
+            }
+            
+            return {
+              path: entry.path,
+              text: entry.text || "",
+              at: atValue,
+              tags: tags,
+              urls: urls,
+              emails: emails
+            };
+          });
+          
+          // Log tag statistics
+          const entriesWithTags = mappedEntries.filter(e => e.tags.length > 0);
+          const allTags = new Set();
+          mappedEntries.forEach(e => e.tags.forEach(t => allTags.add(t)));
+          console.log("[DB] ✅ Loaded", mappedEntries.length, "entries");
+          console.log("[DB] 📊 Tag stats:", {
+            entriesWithTags: entriesWithTags.length,
+            totalTags: allTags.size,
+            tags: Array.from(allTags)
+          });
+          
+          // Show sample entries with their tags
+          if (entriesWithTags.length > 0) {
+            console.log("[DB] Sample entries with tags:", entriesWithTags.slice(0, 5).map(e => ({
+              path: e.path.split('/').pop(),
+              tags: e.tags,
+              textPreview: e.text.substring(0, 50)
+            })));
+          } else {
+            console.warn("[DB] ⚠️ No entries have tags! Existing screenshots may need to be reprocessed.");
+          }
+          
+          setEntries(mappedEntries);
         } else {
           console.log("[DB] No entries found in database");
         }
@@ -489,6 +659,19 @@ function App() {
   useEffect(() => {
     let unlisten;
     let unlistenBatch;
+    let unlistenQuickSearch;
+    
+    // Listen for quick search selection
+    listen("quick-search-select", (event) => {
+      const payload = event.payload;
+      if (payload && payload.path) {
+        setViewerPath(payload.path);
+        // Also set as selected path for preview
+        setSelectedPath(payload.path);
+      }
+    }).then((unlistenFn) => {
+      unlistenQuickSearch = unlistenFn;
+    });
 
     listen("ocr-status", (event) => {
       const payload = event.payload ?? {};
@@ -612,10 +795,18 @@ function App() {
           // CRITICAL: Ensure text is stored - don't trim if it would make it empty, but do trim whitespace
           const textToStore = text ? String(text).trim() : "";
           
+          // Extract tags, URLs, emails from backend (they're already computed and stored)
+          const tags = payload.tags ? (typeof payload.tags === 'string' ? JSON.parse(payload.tags) : payload.tags) : [];
+          const urls = payload.urls ? (typeof payload.urls === 'string' ? JSON.parse(payload.urls) : payload.urls) : [];
+          const emails = payload.emails ? (typeof payload.emails === 'string' ? JSON.parse(payload.emails) : payload.emails) : [];
+          
           const nextEntry = {
             path: normalizedPath,
             text: textToStore, // Store full text, ensure it's a string
             at: existingIndex >= 0 ? current[existingIndex].at : createdAt, // Preserve original creation date for updates
+            tags: tags,
+            urls: urls,
+            emails: emails
           };
           
           // CRITICAL VERIFICATION: Log exactly what we're storing
@@ -626,7 +817,11 @@ function App() {
             textType: typeof nextEntry.text,
             textValue: nextEntry.text.substring(0, 100),
             hasText: !!nextEntry.text && nextEntry.text.length > 0,
-            at: nextEntry.at
+            at: nextEntry.at,
+            tags: tags,
+            tagsLength: tags.length,
+            urls: urls,
+            emails: emails
           });
           
           // Verify text is being stored
@@ -826,6 +1021,9 @@ function App() {
       if (unlistenBatch) {
         unlistenBatch();
       }
+      if (unlistenQuickSearch) {
+        unlistenQuickSearch();
+      }
     };
   }, []);
 
@@ -920,6 +1118,9 @@ function App() {
     return `${seconds}s remaining`;
   }, [batchProgress.etaSeconds]);
 
+  // Ref for search input
+  const searchInputRef = useRef(null);
+
   useEffect(() => {
     const handleKey = (event) => {
       const target = event.target;
@@ -928,6 +1129,25 @@ function App() {
         (target.tagName === "INPUT" ||
           target.tagName === "TEXTAREA" ||
           target.isContentEditable);
+      
+      // Focus search: Cmd+F or /
+      if ((event.metaKey || event.ctrlKey) && event.key === "f") {
+        event.preventDefault();
+        if (searchInputRef.current) {
+          searchInputRef.current.focus();
+          searchInputRef.current.select();
+        }
+        return;
+      }
+      if (event.key === "/" && !isEditable) {
+        event.preventDefault();
+        if (searchInputRef.current) {
+          searchInputRef.current.focus();
+          searchInputRef.current.select();
+        }
+        return;
+      }
+      
       if (isEditable) {
         return;
       }
@@ -954,13 +1174,25 @@ function App() {
         event.preventDefault();
         selectAllFiltered();
       }
+      // Collection shortcuts: Cmd+1-8 for collections
+      if ((event.metaKey || event.ctrlKey) && event.key >= "1" && event.key <= "8") {
+        event.preventDefault();
+        const collections = [null, 'Code', 'Messages', 'Design', 'Documents', 'Receipts', 'Browser', 'Terminal', 'Errors', 'Images'];
+        const idx = parseInt(event.key);
+        setSelectedCollection(collections[idx]);
+      }
+      // Clear collection filter: Cmd+0
+      if ((event.metaKey || event.ctrlKey) && event.key === "0") {
+        event.preventDefault();
+        setSelectedCollection(null);
+      }
     };
 
     window.addEventListener("keydown", handleKey);
     return () => {
       window.removeEventListener("keydown", handleKey);
     };
-  }, [selectNext, selectPrevious, previewEntry, selectAllFiltered, viewerPath]);
+  }, [selectNext, selectPrevious, previewEntry, selectAllFiltered, viewerPath, searchInputRef]);
 
   return (
     <main className="min-h-full bg-[#111316] text-slate-100">
@@ -1015,30 +1247,232 @@ function App() {
           </div>
         ) : null}
 
-        <div className="mt-6">
-          <div className="flex items-center gap-3 rounded-xl border border-slate-700/70 bg-[#0f1114] px-3 py-2 text-sm text-slate-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_14px_40px_rgba(0,0,0,0.55)] focus-within:border-emerald-500/60 focus-within:ring-2 focus-within:ring-emerald-500/20">
-            <svg
-              aria-hidden="true"
-              viewBox="0 0 24 24"
-              className="h-4 w-4 text-slate-400"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.8"
-            >
-              <circle cx="11" cy="11" r="7" />
-              <path d="M16.5 16.5 21 21" />
-            </svg>
-            <input
-              id="search"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search screenshots..."
-              className="w-full bg-transparent text-sm text-slate-100 placeholder:text-slate-500/80 focus:outline-none"
-            />
-          </div>
+        {/* View Toggle: All vs Similar */}
+        <div className="mt-4 flex items-center gap-2">
+          <button
+            onClick={() => setShowSimilar(false)}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium transition ${
+              !showSimilar
+                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                : 'bg-slate-800/50 text-slate-300 border border-slate-700/50 hover:bg-slate-700/50'
+            }`}
+          >
+            All Screenshots
+          </button>
+          <button
+            onClick={async () => {
+              setShowSimilar(true);
+              try {
+                const groups = await invoke('find_similar_screenshots', { threshold: 10 });
+                setSimilarGroups(groups);
+              } catch (e) {
+                console.error('Failed to find similar:', e);
+              }
+            }}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium transition ${
+              showSimilar
+                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                : 'bg-slate-800/50 text-slate-300 border border-slate-700/50 hover:bg-slate-700/50'
+            }`}
+          >
+            Similar Screenshots
+          </button>
         </div>
 
-        <div className="mt-6">
+        {/* Collection Filter Bar */}
+        <div className="mt-4 flex items-center gap-2 overflow-x-auto pb-2">
+          <button
+            onClick={async () => {
+              try {
+                console.log("[REPROCESS] Starting to reprocess all entries for tags...");
+                const updated = await invoke("reprocess_all_tags");
+                console.log("[REPROCESS] ✅ Reprocessed", updated, "entries");
+                
+                // Also compute missing perceptual hashes for similar screenshots
+                console.log("[HASH] Computing missing perceptual hashes...");
+                const hashesComputed = await invoke("compute_missing_hashes");
+                console.log("[HASH] ✅ Computed", hashesComputed, "perceptual hashes");
+                
+                // Reload entries to get updated tags
+                const dbEntries = await invoke("load_all_entries");
+                if (Array.isArray(dbEntries)) {
+                  const mappedEntries = dbEntries.map(entry => {
+                    let tags = [];
+                    try {
+                      if (entry.tags) {
+                        tags = typeof entry.tags === 'string' ? JSON.parse(entry.tags) : (Array.isArray(entry.tags) ? entry.tags : []);
+                      }
+                    } catch (e) {
+                      console.warn("Failed to parse tags:", e);
+                    }
+                    
+                    let atValue = entry.at || new Date().toISOString();
+                    if (typeof entry.at === 'string' && /^\d+$/.test(entry.at)) {
+                      const timestamp = parseInt(entry.at, 10);
+                      const date = timestamp < 946684800000 
+                        ? new Date(timestamp * 1000)
+                        : new Date(timestamp);
+                      atValue = date.toISOString();
+                    } else if (entry.at) {
+                      const parsed = new Date(entry.at);
+                      atValue = isNaN(parsed.getTime()) ? new Date().toISOString() : parsed.toISOString();
+                    }
+                    
+                    return {
+                      path: entry.path,
+                      text: entry.text || "",
+                      at: atValue,
+                      tags: tags,
+                      urls: entry.urls ? (typeof entry.urls === 'string' ? JSON.parse(entry.urls) : (Array.isArray(entry.urls) ? entry.urls : [])) : [],
+                      emails: entry.emails ? (typeof entry.emails === 'string' ? JSON.parse(entry.emails) : (Array.isArray(entry.emails) ? entry.emails : [])) : []
+                    };
+                  });
+                  setEntries(mappedEntries);
+                  alert(`✅ Reprocessed ${updated} entries. Tags have been updated!`);
+                }
+              } catch (e) {
+                console.error("[REPROCESS] Error:", e);
+                alert(`Failed to reprocess entries: ${e}`);
+              }
+            }}
+            className="px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap bg-slate-700/50 text-slate-300 border border-slate-600/50 hover:bg-slate-600/50 transition"
+            title="Reprocess all entries to detect tags"
+          >
+            🔄 Reprocess Tags
+          </button>
+          <button
+            onClick={() => setSelectedCollection(null)}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition ${
+              selectedCollection === null
+                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                : 'bg-slate-800/50 text-slate-300 border border-slate-700/50 hover:bg-slate-700/50'
+            }`}
+          >
+            All
+          </button>
+          {['Code', 'Messages', 'Design', 'Documents', 'Receipts', 'Browser', 'Terminal', 'Errors', 'Images'].map(collection => {
+            const colors = {
+              'Code': 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40',
+              'Messages': 'bg-blue-500/20 text-blue-300 border-blue-500/40',
+              'Design': 'bg-purple-500/20 text-purple-300 border-purple-500/40',
+              'Documents': 'bg-amber-500/20 text-amber-300 border-amber-500/40',
+              'Receipts': 'bg-red-500/20 text-red-300 border-red-500/40',
+              'Browser': 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40',
+              'Terminal': 'bg-gray-500/20 text-gray-300 border-gray-500/40',
+              'Errors': 'bg-red-600/20 text-red-400 border-red-600/40',
+              'Images': 'bg-pink-500/20 text-pink-300 border-pink-500/40'
+            };
+            const count = entries.filter(e => {
+              const tags = Array.isArray(e.tags) ? e.tags : (e.tags ? JSON.parse(e.tags) : []);
+              return tags.includes(collection);
+            }).length;
+            return (
+              <button
+                key={collection}
+                onClick={() => {
+                  console.log("[COLLECTION] Clicked:", collection);
+                  console.log("[COLLECTION] Current selectedCollection:", selectedCollection);
+                  setSelectedCollection(collection);
+                  console.log("[COLLECTION] Set selectedCollection to:", collection);
+                }}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition ${
+                  selectedCollection === collection
+                    ? colors[collection]
+                    : 'bg-slate-800/50 text-slate-300 border border-slate-700/50 hover:bg-slate-700/50'
+                }`}
+              >
+                {collection} {count > 0 && <span className="opacity-70">({count})</span>}
+              </button>
+            );
+          })}
+        </div>
+        
+        {/* Search Bar */}
+        <div className="mt-4">
+          <input
+            ref={searchInputRef}
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search screenshots by text or filename..."
+            className="w-full rounded-lg border border-slate-700/50 bg-slate-800/30 px-4 py-2.5 text-sm text-slate-200 placeholder:text-slate-500 focus:border-slate-600/50 focus:outline-none focus:bg-slate-800/50"
+            autoFocus={false}
+          />
+        </div>
+        
+        {showSimilar ? (
+          <div className="mt-6">
+            <h2 className="text-white text-xl mb-4">
+              Similar Screenshots ({similarGroups.length} groups)
+            </h2>
+            {similarGroups.length === 0 ? (
+              <div className="rounded-2xl border border-slate-700/70 bg-[#0f1114] px-6 py-12 text-center">
+                <div className="text-6xl mb-4">🎉</div>
+                <p className="text-base font-medium text-slate-200">No duplicate screenshots found!</p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {similarGroups.map((group, idx) => (
+                  <div key={idx} className="rounded-lg border border-slate-700/70 bg-[#0f1114] p-4">
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="text-white text-sm">
+                        Group {idx + 1} - {group.length} similar screenshots
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={async () => {
+                            // Keep newest (last in array), delete rest
+                            const sorted = [...group].sort().reverse();
+                            const toDelete = sorted.slice(1);
+                            try {
+                              await invoke('delete_files', { paths: toDelete });
+                              const groups = await invoke('find_similar_screenshots', { threshold: 10 });
+                              setSimilarGroups(groups);
+                            } catch (e) {
+                              console.error('Delete failed:', e);
+                            }
+                          }}
+                          className="px-3 py-1 bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 rounded text-xs hover:bg-emerald-500/30"
+                        >
+                          Keep Newest
+                        </button>
+                        <button
+                          onClick={async () => {
+                            try {
+                              await invoke('delete_files', { paths: group });
+                              const groups = await invoke('find_similar_screenshots', { threshold: 10 });
+                              setSimilarGroups(groups);
+                            } catch (e) {
+                              console.error('Delete failed:', e);
+                            }
+                          }}
+                          className="px-3 py-1 bg-rose-500/20 text-rose-300 border border-rose-500/40 rounded text-xs hover:bg-rose-500/30"
+                        >
+                          Delete All
+                        </button>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-4 gap-3">
+                      {group.map(path => (
+                        <div key={path} className="relative">
+                          <img
+                            src={convertFileSrc(path)}
+                            alt=""
+                            className="w-full h-24 object-cover rounded border border-slate-700/50"
+                          />
+                          <p className="text-[10px] text-slate-400 mt-1 truncate" title={path}>
+                            {path.split('/').pop()}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="mt-6">
           <div className="flex flex-wrap items-center justify-between gap-3 text-xs uppercase tracking-[0.2em] text-slate-400/80">
             <p>
               {filteredEntries.length} result{filteredEntries.length === 1 ? "" : "s"}
@@ -1056,7 +1490,7 @@ function App() {
                 type="button"
                 onClick={selectAllFiltered}
                 disabled={!filteredEntries.length}
-                className="rounded-lg border border-slate-700/70 bg-[#0f1114] px-2 py-1 text-[11px] text-slate-200 transition enabled:hover:border-slate-500/70 enabled:hover:text-slate-100 disabled:opacity-40"
+                className="rounded-lg border border-slate-700/70 bg-[#0f1114] px-2 py-1 text-[11px] text-slate-200 transition enabled:hover:border-slate-500/70 enabled:hover:text-slate-100 disabled:opacity-40 tracking-normal"
               >
                 Select all
               </button>
@@ -1064,7 +1498,7 @@ function App() {
                 type="button"
                 onClick={clearSelection}
                 disabled={!selectedCount}
-                className="rounded-lg border border-slate-700/70 bg-[#0f1114] px-2 py-1 text-[11px] text-slate-200 transition enabled:hover:border-slate-500/70 enabled:hover:text-slate-100 disabled:opacity-40"
+                className="rounded-lg border border-slate-700/70 bg-[#0f1114] px-2 py-1 text-[11px] text-slate-200 transition enabled:hover:border-slate-500/70 enabled:hover:text-slate-100 disabled:opacity-40 tracking-normal"
               >
                 Clear
               </button>
@@ -1072,7 +1506,7 @@ function App() {
                 type="button"
                 onClick={deleteSelected}
                 disabled={!selectedCount}
-                className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-[11px] text-rose-200 transition enabled:hover:border-rose-400/70 enabled:hover:text-rose-100 disabled:opacity-40"
+                className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-[11px] text-rose-200 transition enabled:hover:border-rose-400/70 enabled:hover:text-rose-100 disabled:opacity-40 tracking-normal"
               >
                 Delete
               </button>
@@ -1160,10 +1594,39 @@ function App() {
                                 />
                               </div>
                             </div>
-                            <div className="px-2.5 pb-2.5 pt-1">
+                            <div className="px-2.5 pb-2.5 pt-1 space-y-1.5">
                               <p className="text-[10px] text-slate-400/80">
                                 {formatDateTime(entry.at)}
                               </p>
+                              {entry.tags && entry.tags.length > 0 && (
+                                <div className="flex flex-wrap gap-1">
+                                  {entry.tags.slice(0, 2).map((tag, idx) => {
+                                    const colors = {
+                                      'Code': 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40',
+                                      'Messages': 'bg-blue-500/20 text-blue-300 border-blue-500/40',
+                                      'Design': 'bg-purple-500/20 text-purple-300 border-purple-500/40',
+                                      'Documents': 'bg-amber-500/20 text-amber-300 border-amber-500/40',
+                                      'Receipts': 'bg-red-500/20 text-red-300 border-red-500/40',
+                                      'Browser': 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40',
+                                      'Terminal': 'bg-gray-500/20 text-gray-300 border-gray-500/40',
+                                      'Errors': 'bg-red-600/20 text-red-400 border-red-600/40'
+                                    };
+                                    return (
+                                      <span
+                                        key={idx}
+                                        className={`text-[9px] px-1.5 py-0.5 rounded border ${colors[tag] || 'bg-slate-500/20 text-slate-300 border-slate-500/40'}`}
+                                      >
+                                        {tag}
+                                      </span>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                              {entry.urls && entry.urls.length > 0 && (
+                                <div className="text-[9px] text-cyan-400/80 truncate" title={entry.urls[0]}>
+                                  🔗 {entry.urls[0].replace(/^https?:\/\//, '').substring(0, 30)}
+                                </div>
+                              )}
                             </div>
                           </div>
                         );
@@ -1174,62 +1637,113 @@ function App() {
               </div>
             )}
           </div>
+          </div>
+        )}
         </div>
-        </div>
-        {viewerPath ? (
+      </div>
+      
+      {viewerPath ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6"
+          onClick={() => setViewerPath("")}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              setViewerPath("");
+            }
+          }}
+        >
           <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6"
-            onClick={() => setViewerPath("")}
-            role="button"
-            tabIndex={0}
-            onKeyDown={(event) => {
-              if (event.key === "Escape") {
-                setViewerPath("");
-              }
-            }}
+            className="w-full max-w-5xl rounded-3xl border border-slate-700/70 bg-[#0f1114] p-4 shadow-[0_30px_120px_rgba(0,0,0,0.7)]"
+            onClick={(event) => event.stopPropagation()}
           >
-            <div
-              className="w-full max-w-5xl rounded-3xl border border-slate-700/70 bg-[#0f1114] p-4 shadow-[0_30px_120px_rgba(0,0,0,0.7)]"
-              onClick={(event) => event.stopPropagation()}
-            >
-              <div className="flex items-center justify-between gap-3 pb-3">
+            <div className="flex items-center justify-between gap-3 pb-3">
+              <div className="flex-1 min-w-0">
                 <p className="truncate text-xs text-slate-300/80">
                   {displayPath(viewerPath)}
                 </p>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={copyViewerImage}
-                    className={`rounded-lg border px-3 py-1 text-[11px] transition ${
-                      copySuccess
-                        ? "border-emerald-500/70 bg-emerald-500/10 text-emerald-200"
-                        : "border-slate-700/70 bg-[#0f1114] text-slate-200 hover:border-slate-500/70 hover:text-slate-100"
-                    }`}
-                  >
-                    {copySuccess ? "Copied!" : "Copy"}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setViewerPath("")}
-                    className="rounded-lg border border-slate-700/70 bg-[#0f1114] px-3 py-1 text-[11px] text-slate-200 transition hover:border-slate-500/70 hover:text-slate-100"
-                  >
-                    Close
-                  </button>
-                </div>
+                {previewEntry && (
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    {previewEntry.tags && previewEntry.tags.length > 0 && (
+                      <>
+                        {previewEntry.tags.map((tag, idx) => {
+                          const colors = {
+                            'Code': 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40',
+                            'Messages': 'bg-blue-500/20 text-blue-300 border-blue-500/40',
+                            'Design': 'bg-purple-500/20 text-purple-300 border-purple-500/40',
+                            'Documents': 'bg-amber-500/20 text-amber-300 border-amber-500/40',
+                            'Receipts': 'bg-red-500/20 text-red-300 border-red-500/40',
+                            'Browser': 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40',
+                            'Terminal': 'bg-gray-500/20 text-gray-300 border-gray-500/40',
+                            'Errors': 'bg-red-600/20 text-red-400 border-red-600/40'
+                          };
+                          return (
+                            <span
+                              key={idx}
+                              className={`text-[10px] px-2 py-0.5 rounded border ${colors[tag] || 'bg-slate-500/20 text-slate-300 border-slate-500/40'}`}
+                            >
+                              {tag}
+                            </span>
+                          );
+                        })}
+                      </>
+                    )}
+                    {previewEntry.urls && previewEntry.urls.length > 0 && (
+                      <a
+                        href={previewEntry.urls[0]}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-[10px] text-cyan-400 hover:text-cyan-300 underline truncate max-w-xs"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        🔗 {previewEntry.urls[0].replace(/^https?:\/\//, '')}
+                      </a>
+                    )}
+                    {previewEntry.emails && previewEntry.emails.length > 0 && (
+                      <a
+                        href={`mailto:${previewEntry.emails[0]}`}
+                        className="text-[10px] text-blue-400 hover:text-blue-300 underline"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        ✉️ {previewEntry.emails[0]}
+                      </a>
+                    )}
+                  </div>
+                )}
               </div>
-              <div className="flex max-h-[80vh] items-center justify-center overflow-hidden rounded-2xl bg-[#16191e]">
-                <img
-                  src={viewerSrc}
-                  alt="Screenshot full view"
-                  className="max-h-[80vh] w-full object-contain"
-                />
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={copyViewerImage}
+                  className={`rounded-lg border px-3 py-1 text-[11px] transition ${
+                    copySuccess
+                      ? "border-emerald-500/70 bg-emerald-500/10 text-emerald-200"
+                      : "border-slate-700/70 bg-[#0f1114] text-slate-200 hover:border-slate-500/70 hover:text-slate-100"
+                  }`}
+                >
+                  {copySuccess ? "Copied!" : "Copy"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setViewerPath("")}
+                  className="rounded-lg border border-slate-700/70 bg-[#0f1114] px-3 py-1 text-[11px] text-slate-200 transition hover:border-slate-500/70 hover:text-slate-100"
+                >
+                  Close
+                </button>
               </div>
             </div>
+            <div className="flex max-h-[80vh] items-center justify-center overflow-hidden rounded-2xl bg-[#16191e]">
+              <img
+                src={viewerSrc}
+                alt="Screenshot full view"
+                className="max-h-[80vh] w-full object-contain"
+              />
+            </div>
           </div>
-        ) : null}
-      </div>
+        </div>
+      ) : null}
     </main>
   );
-}
-
+  }
 export default App;
