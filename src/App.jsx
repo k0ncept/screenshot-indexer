@@ -2,6 +2,411 @@ import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 
+// Component for displaying similar screenshot groups with space savings
+function SimilarGroupList({ groups, setSimilarGroups, setEntries, entries, setSelectedPath, setViewerPath, selectedPathsSet, toggleSelection, formatDateTime, previewEntry }) {
+  const [groupMetadata, setGroupMetadata] = useState({});
+  const [spaceSavings, setSpaceSavings] = useState({});
+  
+  const formatBytes = useCallback((bytes) => {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
+  }, []);
+  
+  // Load metadata for all groups
+  useEffect(() => {
+    const loadMetadata = async () => {
+      const metadataMap = {};
+      const savingsMap = {};
+      
+      for (let idx = 0; idx < groups.length; idx++) {
+        const group = groups[idx];
+        try {
+          const metadata = await invoke('get_file_metadata', { paths: group });
+          if (metadata && metadata.length > 0) {
+            metadataMap[idx] = metadata;
+            
+            // Calculate space savings (total - newest size)
+            const totalSize = metadata.reduce((sum, m) => sum + (m.size || 0), 0);
+            if (metadata.length > 1) {
+              // Sort by date to find newest
+              const sorted = [...metadata].sort((a, b) => {
+                const dateA = parseInt(a.created_at || '0', 10);
+                const dateB = parseInt(b.created_at || '0', 10);
+                return dateB - dateA; // Newest first
+              });
+              const newestSize = sorted[0]?.size || 0;
+              savingsMap[idx] = totalSize - newestSize;
+            } else {
+              savingsMap[idx] = 0;
+            }
+          }
+        } catch (e) {
+          console.error(`Failed to get metadata for group ${idx}:`, e);
+        }
+      }
+      
+      setGroupMetadata(metadataMap);
+      setSpaceSavings(savingsMap);
+    };
+    
+    if (groups.length > 0) {
+      loadMetadata();
+    }
+  }, [groups]);
+  
+  const handleKeepNewest = async (group, groupIdx) => {
+    try {
+      // Get metadata to sort by date
+      const metadata = groupMetadata[groupIdx] || await invoke('get_file_metadata', { paths: group });
+      if (!metadata || metadata.length === 0) {
+        console.error('Failed to get file metadata');
+        return;
+      }
+      
+      // Sort by creation date (newest first)
+      const sorted = [...metadata].sort((a, b) => {
+        const dateA = parseInt(a.created_at || '0', 10);
+        const dateB = parseInt(b.created_at || '0', 10);
+        return dateB - dateA; // Newest first
+      });
+      
+      // Keep newest (first in sorted array), delete rest
+      const toDelete = sorted.slice(1).map(m => m.path);
+      
+      if (toDelete.length > 0) {
+        await invoke('delete_files', { paths: toDelete });
+        // Reload entries and refresh similar groups
+        const dbEntries = await invoke('load_all_entries');
+        if (Array.isArray(dbEntries)) {
+          const mappedEntries = dbEntries.map(entry => {
+            let tags = [];
+            try {
+              if (entry.tags) {
+                tags = typeof entry.tags === 'string' ? JSON.parse(entry.tags) : (Array.isArray(entry.tags) ? entry.tags : []);
+              }
+            } catch (e) {
+              console.warn("Failed to parse tags:", e);
+            }
+            
+            let atValue = entry.at || new Date().toISOString();
+            if (typeof entry.at === 'string' && /^\d+$/.test(entry.at)) {
+              const timestamp = parseInt(entry.at, 10);
+              const date = timestamp < 946684800000 
+                ? new Date(timestamp * 1000)
+                : new Date(timestamp);
+              atValue = date.toISOString();
+            } else if (entry.at) {
+              const parsed = new Date(entry.at);
+              atValue = isNaN(parsed.getTime()) ? new Date().toISOString() : parsed.toISOString();
+            }
+            
+            return {
+              path: entry.path,
+              text: entry.text || "",
+              at: atValue,
+              tags: tags,
+              urls: entry.urls ? (typeof entry.urls === 'string' ? JSON.parse(entry.urls) : (Array.isArray(entry.urls) ? entry.urls : [])) : [],
+              emails: entry.emails ? (typeof entry.emails === 'string' ? JSON.parse(entry.emails) : (Array.isArray(entry.emails) ? entry.emails : [])) : []
+            };
+          });
+          setEntries(mappedEntries);
+        }
+        const updatedGroups = await invoke('find_similar_screenshots', { threshold: 10 });
+        setSimilarGroups(updatedGroups);
+      }
+    } catch (e) {
+      console.error('Delete failed:', e);
+      alert(`Failed to delete files: ${e}`);
+    }
+  };
+  
+  const handleDeleteAll = async (group) => {
+    try {
+      await invoke('delete_files', { paths: group });
+      // Reload entries
+      const dbEntries = await invoke('load_all_entries');
+      if (Array.isArray(dbEntries)) {
+        const mappedEntries = dbEntries.map(entry => {
+          let tags = [];
+          try {
+            if (entry.tags) {
+              tags = typeof entry.tags === 'string' ? JSON.parse(entry.tags) : (Array.isArray(entry.tags) ? entry.tags : []);
+            }
+          } catch (e) {
+            console.warn("Failed to parse tags:", e);
+          }
+          
+          let atValue = entry.at || new Date().toISOString();
+          if (typeof entry.at === 'string' && /^\d+$/.test(entry.at)) {
+            const timestamp = parseInt(entry.at, 10);
+            const date = timestamp < 946684800000 
+              ? new Date(timestamp * 1000)
+              : new Date(timestamp);
+            atValue = date.toISOString();
+          } else if (entry.at) {
+            const parsed = new Date(entry.at);
+            atValue = isNaN(parsed.getTime()) ? new Date().toISOString() : parsed.toISOString();
+          }
+          
+          return {
+            path: entry.path,
+            text: entry.text || "",
+            at: atValue,
+            tags: tags,
+            urls: entry.urls ? (typeof entry.urls === 'string' ? JSON.parse(entry.urls) : (Array.isArray(entry.urls) ? entry.urls : [])) : [],
+            emails: entry.emails ? (typeof entry.emails === 'string' ? JSON.parse(entry.emails) : (Array.isArray(entry.emails) ? entry.emails : [])) : []
+          };
+        });
+        setEntries(mappedEntries);
+      }
+      const updatedGroups = await invoke('find_similar_screenshots', { threshold: 10 });
+      setSimilarGroups(updatedGroups);
+    } catch (e) {
+      console.error('Delete failed:', e);
+      alert(`Failed to delete files: ${e}`);
+    }
+  };
+  
+  // Debug: Log groups structure
+  useEffect(() => {
+    if (groups.length > 0) {
+      console.log('[SIMILAR] Groups structure:', groups.map((g, i) => ({ idx: i, length: g?.length, type: Array.isArray(g) ? 'array' : typeof g, sample: g?.[0] })));
+    }
+  }, [groups]);
+  
+  return (
+    <div className="space-y-4">
+      {groups.map((group, idx) => {
+        // Ensure group is an array
+        if (!Array.isArray(group)) {
+          console.warn(`[SIMILAR] Group ${idx} is not an array:`, group);
+          return null;
+        }
+        
+        // Filter out any invalid paths
+        const validPaths = group.filter(p => p && String(p).trim().length > 0);
+        
+        if (validPaths.length === 0) {
+          console.warn(`[SIMILAR] Group ${idx} has no valid paths`);
+          return null;
+        }
+        
+        return (
+          <div key={idx} className="rounded-lg border border-slate-700/70 bg-[#0f1114] p-4">
+          <div className="flex items-center justify-between mb-3">
+            <div className="text-white text-sm">
+              Group {idx + 1} - {validPaths.length} similar screenshots
+              {spaceSavings[idx] > 0 && (
+                <span className="ml-2 text-emerald-400 text-xs">
+                  (Save {formatBytes(spaceSavings[idx])})
+                </span>
+              )}
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => handleKeepNewest(group, idx)}
+                className="px-3 py-1 bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 rounded text-xs hover:bg-emerald-500/30"
+              >
+                Keep Newest
+              </button>
+              <button
+                onClick={() => handleDeleteAll(group)}
+                className="px-3 py-1 bg-rose-500/20 text-rose-300 border border-rose-500/40 rounded text-xs hover:bg-rose-500/30"
+              >
+                Delete All
+              </button>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-[20px] sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
+            {(() => {
+              // Map each path to either its entry or the path itself
+              // This ensures we render ALL paths, even if we can't find the entry
+              const groupItems = validPaths.map((path, pathIdx) => {
+                const pathStr = String(path || "").trim();
+                if (!pathStr) return null;
+                
+                // Normalize path for matching (same normalization used elsewhere)
+                const normalizedPath = pathStr.replace(/\/+/g, "/").replace(/\/$/, "");
+                
+                // Try multiple matching strategies to find the entry
+                let entry = entries.find(e => {
+                  const entryPath = String(e.path || "").trim();
+                  // Strategy 1: Exact match
+                  if (entryPath === pathStr || entryPath === normalizedPath) {
+                    return true;
+                  }
+                  // Strategy 2: Normalized match
+                  const normalizedEntryPath = entryPath.replace(/\/+/g, "/").replace(/\/$/, "");
+                  if (normalizedEntryPath === normalizedPath) {
+                    return true;
+                  }
+                  // Strategy 3: Case-insensitive normalized match
+                  if (normalizedEntryPath.toLowerCase() === normalizedPath.toLowerCase()) {
+                    return true;
+                  }
+                  return false;
+                });
+                
+                // Return either the entry or just the path
+                return entry ? { entry, path: pathStr } : { entry: null, path: pathStr };
+              }).filter(Boolean);
+              
+              // Log how many entries we found
+              const foundEntries = groupItems.filter(item => item.entry).length;
+              if (foundEntries !== validPaths.length) {
+                console.warn(`[SIMILAR] Group ${idx}: Found ${foundEntries} entries out of ${validPaths.length} paths`);
+              }
+              
+              // Render all items - use entry if available, otherwise use path directly
+              return groupItems.map(({ entry, path: pathStr }) => {
+                // If we have an entry, use it (same as main view)
+                if (entry) {
+                  const isSelected = selectedPathsSet.has(entry.path);
+                  const isActive = entry.path === previewEntry?.path;
+                
+                return (
+                  <div
+                    key={entry.path}
+                    className={`group relative rounded-lg border text-left transition-all duration-200 ease-in-out ${
+                      isActive
+                        ? "border-emerald-500/60 bg-emerald-500/10 shadow-lg shadow-emerald-500/10"
+                        : "border-white/10 bg-white/3 hover:scale-[1.03] hover:border-emerald-500/50 hover:shadow-[0_4px_12px_rgba(0,0,0,0.3)]"
+                    }`}
+                    style={{
+                      border: "1px solid rgba(255, 255, 255, 0.15)",
+                      borderRadius: "8px",
+                    }}
+                    onClick={() => setSelectedPath(entry.path)}
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        setSelectedPath(entry.path);
+                      }
+                    }}
+                  >
+                    <button
+                      type="button"
+                      aria-pressed={isSelected}
+                      aria-label={isSelected ? "Deselect screenshot" : "Select screenshot"}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        toggleSelection(entry.path);
+                      }}
+                      className={`absolute right-2 top-2 z-10 flex h-6 w-6 items-center justify-center rounded-full transition-all ${
+                        isSelected
+                          ? "border-2 border-emerald-500 bg-emerald-500 shadow-md shadow-emerald-500/20"
+                          : "border-2 border-white/30 bg-[#0f1114]/90 hover:border-emerald-400/60 hover:bg-emerald-400/10"
+                      }`}
+                      style={{
+                        border: isSelected ? "2px solid rgb(16, 185, 129)" : "2px solid rgba(255, 255, 255, 0.3)",
+                      }}
+                    >
+                      {isSelected && (
+                        <svg
+                          className="h-3 w-3 text-white"
+                          fill="none"
+                          viewBox="0 0 24 24"
+                          stroke="currentColor"
+                          strokeWidth={3}
+                        >
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                        </svg>
+                      )}
+                    </button>
+                    <div className="p-1.5">
+                      <div className="overflow-hidden rounded-lg bg-[#16191e]">
+                        <img
+                          src={convertFileSrc(entry.path)}
+                          alt="Screenshot preview"
+                          className="h-36 w-full object-cover brightness-105 contrast-105 transition-transform duration-200 group-hover:scale-105"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setViewerPath(entry.path);
+                          }}
+                        />
+                      </div>
+                    </div>
+                    <div className="px-2.5 pb-2.5 pt-1 space-y-1.5">
+                      <p className="text-[10px] text-slate-400/80">
+                        {formatDateTime(entry.at)}
+                      </p>
+                      {entry.tags && entry.tags.length > 0 && (
+                        <div className="flex flex-wrap gap-1">
+                          {entry.tags.slice(0, 2).map((tag, tagIdx) => {
+                            const colors = {
+                              'Code': 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40',
+                              'Messages': 'bg-blue-500/20 text-blue-300 border-blue-500/40',
+                              'Design': 'bg-purple-500/20 text-purple-300 border-purple-500/40',
+                              'Documents': 'bg-amber-500/20 text-amber-300 border-amber-500/40',
+                              'Receipts': 'bg-red-500/20 text-red-300 border-red-500/40',
+                              'Browser': 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40',
+                              'Terminal': 'bg-gray-500/20 text-gray-300 border-gray-500/40',
+                              'Errors': 'bg-red-600/20 text-red-400 border-red-600/40',
+                              'Images': 'bg-pink-500/20 text-pink-300 border-pink-500/40'
+                            };
+                            return (
+                              <span
+                                key={tagIdx}
+                                className={`text-[9px] px-1.5 py-0.5 rounded border ${colors[tag] || 'bg-slate-500/20 text-slate-300 border-slate-500/40'}`}
+                              >
+                                {tag}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      )}
+                      {entry.urls && entry.urls.length > 0 && (
+                        <div className="text-[9px] text-cyan-400/80 truncate" title={entry.urls[0]}>
+                          🔗 {entry.urls[0].replace(/^https?:\/\//, '').substring(0, 30)}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+                }
+                
+                // Fallback: render using path directly (no entry found)
+                return (
+                  <div
+                    key={pathStr}
+                    className="group relative rounded-lg border border-white/10 bg-white/3 hover:scale-[1.03] hover:border-emerald-500/50 hover:shadow-[0_4px_12px_rgba(0,0,0,0.3)] p-1.5"
+                    style={{
+                      border: "1px solid rgba(255, 255, 255, 0.15)",
+                      borderRadius: "8px",
+                    }}
+                  >
+                    <div className="overflow-hidden rounded-lg bg-[#16191e]">
+                      <img
+                        src={convertFileSrc(pathStr)}
+                        alt="Screenshot preview"
+                        className="h-36 w-full object-cover brightness-105 contrast-105 transition-transform duration-200 group-hover:scale-105"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setViewerPath(pathStr);
+                        }}
+                      />
+                    </div>
+                    <div className="px-2.5 pb-2.5 pt-1">
+                      <p className="text-[10px] text-slate-400/80 truncate" title={pathStr}>
+                        {pathStr.split('/').pop()}
+                      </p>
+                    </div>
+                  </div>
+                );
+              });
+            })()}
+          </div>
+          </div>
+        );
+      }).filter(Boolean)}
+    </div>
+  );
+}
+
 function App() {
   const [status, setStatus] = useState("processing");
   const [lastPath, setLastPath] = useState("");
@@ -660,6 +1065,7 @@ function App() {
     let unlisten;
     let unlistenBatch;
     let unlistenQuickSearch;
+    let unlistenTags;
     
     // Listen for quick search selection
     listen("quick-search-select", (event) => {
@@ -673,6 +1079,27 @@ function App() {
       unlistenQuickSearch = unlistenFn;
     });
 
+    // Listen for tag updates from the async tagging pipeline
+    listen("tags-updated", async (event) => {
+      const { path, tags } = event.payload;
+      console.log("[TAGS] Tags updated for:", path, tags);
+      
+      // Update the entry in our local state
+      setEntries(prevEntries => {
+        return prevEntries.map(entry => {
+          if (entry.path === path) {
+            return {
+              ...entry,
+              tags: Array.isArray(tags) ? tags : (tags ? JSON.parse(tags) : [])
+            };
+          }
+          return entry;
+        });
+      });
+    }).then((unlistenFn) => {
+      unlistenTags = unlistenFn;
+    });
+    
     listen("ocr-status", (event) => {
       const payload = event.payload ?? {};
       const nextStatus = payload.status ?? "processing";
@@ -1024,6 +1451,9 @@ function App() {
       if (unlistenQuickSearch) {
         unlistenQuickSearch();
       }
+      if (unlistenTags) {
+        unlistenTags();
+      }
     };
   }, []);
 
@@ -1284,14 +1714,9 @@ function App() {
           <button
             onClick={async () => {
               try {
-                console.log("[REPROCESS] Starting to reprocess all entries for tags...");
-                const updated = await invoke("reprocess_all_tags");
-                console.log("[REPROCESS] ✅ Reprocessed", updated, "entries");
-                
-                // Also compute missing perceptual hashes for similar screenshots
-                console.log("[HASH] Computing missing perceptual hashes...");
-                const hashesComputed = await invoke("compute_missing_hashes");
-                console.log("[HASH] ✅ Computed", hashesComputed, "perceptual hashes");
+                console.log("[REPROCESS] Starting to reprocess all entries with visual classification...");
+                const processed = await invoke("reprocess_all_with_visual");
+                console.log("[REPROCESS] ✅ Reprocessed", processed, "entries");
                 
                 // Reload entries to get updated tags
                 const dbEntries = await invoke("load_all_entries");
@@ -1328,17 +1753,17 @@ function App() {
                     };
                   });
                   setEntries(mappedEntries);
-                  alert(`✅ Reprocessed ${updated} entries. Tags have been updated!`);
+                  alert(`✅ Reprocessed ${processed} entries with visual classification! Tags have been updated.`);
                 }
               } catch (e) {
                 console.error("[REPROCESS] Error:", e);
                 alert(`Failed to reprocess entries: ${e}`);
               }
             }}
-            className="px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap bg-slate-700/50 text-slate-300 border border-slate-600/50 hover:bg-slate-600/50 transition"
-            title="Reprocess all entries to detect tags"
+            className="px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap bg-emerald-700/50 text-emerald-200 border border-emerald-600/50 hover:bg-emerald-600/50 transition"
+            title="Reprocess all entries with visual classification to improve tags"
           >
-            🔄 Reprocess Tags
+            🔄 Reprocess All (Visual)
           </button>
           <button
             onClick={() => setSelectedCollection(null)}
@@ -1411,64 +1836,18 @@ function App() {
                 <p className="text-base font-medium text-slate-200">No duplicate screenshots found!</p>
               </div>
             ) : (
-              <div className="space-y-4">
-                {similarGroups.map((group, idx) => (
-                  <div key={idx} className="rounded-lg border border-slate-700/70 bg-[#0f1114] p-4">
-                    <div className="flex items-center justify-between mb-3">
-                      <div className="text-white text-sm">
-                        Group {idx + 1} - {group.length} similar screenshots
-                      </div>
-                      <div className="flex gap-2">
-                        <button
-                          onClick={async () => {
-                            // Keep newest (last in array), delete rest
-                            const sorted = [...group].sort().reverse();
-                            const toDelete = sorted.slice(1);
-                            try {
-                              await invoke('delete_files', { paths: toDelete });
-                              const groups = await invoke('find_similar_screenshots', { threshold: 10 });
-                              setSimilarGroups(groups);
-                            } catch (e) {
-                              console.error('Delete failed:', e);
-                            }
-                          }}
-                          className="px-3 py-1 bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 rounded text-xs hover:bg-emerald-500/30"
-                        >
-                          Keep Newest
-                        </button>
-                        <button
-                          onClick={async () => {
-                            try {
-                              await invoke('delete_files', { paths: group });
-                              const groups = await invoke('find_similar_screenshots', { threshold: 10 });
-                              setSimilarGroups(groups);
-                            } catch (e) {
-                              console.error('Delete failed:', e);
-                            }
-                          }}
-                          className="px-3 py-1 bg-rose-500/20 text-rose-300 border border-rose-500/40 rounded text-xs hover:bg-rose-500/30"
-                        >
-                          Delete All
-                        </button>
-                      </div>
-                    </div>
-                    <div className="grid grid-cols-4 gap-3">
-                      {group.map(path => (
-                        <div key={path} className="relative">
-                          <img
-                            src={convertFileSrc(path)}
-                            alt=""
-                            className="w-full h-24 object-cover rounded border border-slate-700/50"
-                          />
-                          <p className="text-[10px] text-slate-400 mt-1 truncate" title={path}>
-                            {path.split('/').pop()}
-                          </p>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                ))}
-              </div>
+              <SimilarGroupList 
+                groups={similarGroups} 
+                setSimilarGroups={setSimilarGroups}
+                setEntries={setEntries}
+                entries={entries}
+                setSelectedPath={setSelectedPath}
+                setViewerPath={setViewerPath}
+                selectedPathsSet={selectedPathsSet}
+                toggleSelection={toggleSelection}
+                formatDateTime={formatDateTime}
+                previewEntry={previewEntry}
+              />
             )}
           </div>
         ) : (
@@ -1745,5 +2124,6 @@ function App() {
       ) : null}
     </main>
   );
-  }
+}
+
 export default App;

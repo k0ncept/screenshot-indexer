@@ -399,7 +399,8 @@ fn fix_ocr_character_mistakes(text: &str) -> String {
 }
 
 // Auto-tagging functions
-// Follows strict priority order: Messages → Code → Design → Receipts → Browser → Terminal → Errors → Documents → Images
+// Follows strict priority order: Messages → Code → Design → Receipts → Browser → Terminal → Errors → Images
+// All screenshots are images, so "Documents" tag has been removed - fallback is always "Images"
 fn detect_collections(text: &str) -> Vec<String> {
     let mut tags = Vec::new();
     let text_lower = text.to_lowercase();
@@ -601,16 +602,42 @@ fn detect_collections(text: &str) -> Vec<String> {
         tags.push("Browser".to_string());
     }
     
-    // TERMINAL DETECTION
-    let has_prompts = text.contains("$ ") || text.contains("~ ") || text.contains("> ");
-    let has_commands = ["cd ", "ls ", "git ", "npm ", "cargo ", "python ", "node "].iter().any(|cmd| text.contains(cmd));
+    // STEP 6: TERMINAL DETECTION (must be strict to avoid false positives)
+    // Terminal has distinct patterns: prompts + commands + output
+    // Check for terminal prompts (must be at start of line or after newline)
+    let prompt_pattern = Regex::new(r"(?m)^[\$~>]\s|[\$~>]\s+").unwrap();
+    let has_prompts = prompt_pattern.is_match(text);
     
-    if has_prompts || has_commands {
-        tags.push("Terminal".to_string());
-        if debug {
-            println!("[TAG] ✅ Tagged as Terminal");
+    // Check for common terminal commands (must be followed by space or newline)
+    let command_pattern = Regex::new(r"\b(cd|ls|git|npm|cargo|python|node|docker|kubectl|ssh|sudo|mkdir|rm|cp|mv|cat|grep|find|ps|kill)\s+").unwrap();
+    let has_commands = command_pattern.is_match(text);
+    
+    // Don't tag as terminal if text is minimal (likely an image with OCR noise)
+    let has_minimal_text = char_count < 50 || word_count < 10;
+    
+    if !has_minimal_text {
+        // Check for terminal output patterns (file paths, command output)
+        let has_terminal_output = text.contains("/") && 
+                                 (text.contains("Permission denied") || 
+                                  text.contains("command not found") ||
+                                  text.contains("No such file") ||
+                                  text.contains("fatal:") ||
+                                  (text.contains("error:") && text.contains("git")));
+        
+        // Terminal must have multiple indicators to avoid false positives
+        // Require: (prompts OR commands) AND (multiple lines OR terminal output)
+        let has_multiple_lines = text.matches("\n").count() >= 2;
+        let is_terminal = (has_prompts || has_commands) && 
+                         (has_multiple_lines || has_terminal_output || has_commands);
+        
+        if is_terminal {
+            tags.push("Terminal".to_string());
+            if debug {
+                println!("[TAG] ✅ Tagged as Terminal (prompts: {}, commands: {}, output: {})", 
+                         has_prompts, has_commands, has_terminal_output);
+            }
+            return tags; // Stop here
         }
-        return tags; // Stop here
     }
     
     // STEP 7: ERROR DETECTION
@@ -660,14 +687,9 @@ fn detect_collections(text: &str) -> Vec<String> {
                            !has_prompts && // Not terminal
                            (has_doc_patterns || has_lists || has_formal_language); // Must have document structure
         
-        // If it looks like a document, add Documents tag
-        if is_plain_text || (word_count > 100 && (has_doc_patterns || has_lists) && !has_questions) {
-            tags.push("Documents".to_string());
-            if debug {
-                println!("[TAG] ✅ Tagged as Documents");
-            }
-            return tags; // Stop here
-        }
+        // Documents detection removed - all screenshots are images
+        // If nothing else matches, will fallback to "Images" tag
+        // (This block intentionally does nothing - documents will be tagged as Images)
     }
     
     // STEP 9: IMAGES/PHOTOS DETECTION (Fallback - very little or no text)
@@ -709,6 +731,358 @@ fn detect_collections(text: &str) -> Vec<String> {
     }
     
     tags
+}
+
+// Separate tagging pipeline - runs asynchronously after OCR
+// This allows for better detection, retries, and doesn't block OCR processing
+// GUARANTEES: Every entry will get at least one tag
+fn process_tags_for_entry(app: &AppHandle, path: &str, text: &str) {
+    println!("[TAG-PIPELINE] Processing tags for: {}", path);
+    
+    let text_len = text.trim().len();
+    
+    // CRITICAL: If no text or very minimal text, tag as Images immediately
+    // This is the most reliable indicator - no text = image/photo
+    if text_len == 0 || text_len < 10 {
+        println!("[TAG-PIPELINE] ✅ No/minimal text detected ({} chars) - tagging as Images", text_len);
+        update_entry_tags(app, path, &vec!["Images".to_string()]);
+        return;
+    }
+    
+    // Try visual classification first (more accurate for screenshots)
+    let mut final_tags = classify_with_clip(path);
+    
+    // If visual classification didn't find tags, try OCR-based detection
+    if final_tags.is_empty() {
+        final_tags = detect_collections_enhanced(text);
+        
+        // If OCR detection also failed, try with cleaned text
+        if final_tags.is_empty() {
+            let cleaned = clean_ocr_text(text);
+            if cleaned != text && !cleaned.trim().is_empty() {
+                final_tags = detect_collections_enhanced(&cleaned);
+            }
+        }
+    }
+    
+    // CRITICAL: If we still have no tags, assign a fallback tag
+    // EVERY entry MUST have at least one tag - no exceptions
+    // Always use "Images" as fallback - all screenshots are images
+    if final_tags.is_empty() {
+        final_tags = vec!["Images".to_string()];
+        
+        println!("[TAG-PIPELINE] ⚠️ No tags detected, assigned fallback: {:?} (text length: {})", 
+                 final_tags, text_len);
+    } else {
+        println!("[TAG-PIPELINE] ✅ Detected tags: {:?}", final_tags);
+    }
+    
+    // Always update tags - this ensures every entry has tags
+    update_entry_tags(app, path, &final_tags);
+}
+
+// Visual feature-based classification for screenshots
+// Analyzes visual characteristics (colors, layout, text regions) to improve accuracy
+fn classify_with_clip(path: &str) -> Vec<String> {
+    use std::path::Path;
+    
+    let image_path = Path::new(path);
+    
+    // Load and analyze the image
+    let img = match image::open(image_path) {
+        Ok(img) => img,
+        Err(e) => {
+            eprintln!("[VISUAL-CLASSIFY] Failed to open image: {}", e);
+            return vec![];
+        }
+    };
+    
+    let (width, height) = img.dimensions();
+    let rgb_img = img.to_rgb8();
+    
+    // Analyze visual features
+    let features = analyze_visual_features(&rgb_img, width, height);
+    
+    // Use visual features to classify
+    let tags = classify_from_features(&features);
+    
+    if !tags.is_empty() {
+        println!("[VISUAL-CLASSIFY] ✅ Classified as: {:?} (confidence: {:.2})", 
+                 tags, features.confidence);
+    }
+    
+    tags
+}
+
+#[derive(Debug)]
+struct VisualFeatures {
+    // Color analysis
+    #[allow(dead_code)]
+    dominant_colors: Vec<(u8, u8, u8)>, // Top 3 colors (kept for future use)
+    color_variance: f64, // How varied the colors are
+    is_dark_mode: bool,
+    
+    // Layout analysis
+    text_density: f64, // Estimated text regions vs total area
+    has_grid_layout: bool, // Regular grid pattern (like messages)
+    has_linear_layout: bool, // Linear vertical layout (like code)
+    
+    // Content analysis
+    has_ui_elements: bool, // Buttons, icons, etc.
+    has_code_blocks: bool, // Monospace-like regions
+    has_images: bool, // Photo-like regions
+    
+    // Overall confidence
+    confidence: f64,
+}
+
+fn analyze_visual_features(img: &image::RgbImage, _width: u32, _height: u32) -> VisualFeatures {
+    let pixels: Vec<_> = img.pixels().collect();
+    let total_pixels = pixels.len();
+    
+    // Sample pixels for analysis (every 10th pixel for performance)
+    let sample_size = total_pixels.min(10000);
+    let step = total_pixels / sample_size;
+    
+    let mut color_counts: HashMap<(u8, u8, u8), usize> = HashMap::new();
+    let mut total_brightness = 0u64;
+    let mut dark_pixels = 0;
+    
+    for i in (0..total_pixels).step_by(step.max(1)) {
+        let pixel = pixels[i];
+        let (r, g, b) = (pixel[0], pixel[1], pixel[2]);
+        
+        // Quantize colors to reduce noise
+        let quantized = (r / 32 * 32, g / 32 * 32, b / 32 * 32);
+        *color_counts.entry(quantized).or_insert(0) += 1;
+        
+        // Calculate brightness
+        let brightness = (r as u64 + g as u64 + b as u64) / 3;
+        total_brightness += brightness;
+        
+        if brightness < 50 {
+            dark_pixels += 1;
+        }
+    }
+    
+    // Get dominant colors
+    let mut color_vec: Vec<_> = color_counts.iter().collect();
+    color_vec.sort_by(|a, b| b.1.cmp(a.1));
+    let dominant_colors: Vec<_> = color_vec.iter()
+        .take(3)
+        .map(|((r, g, b), _)| (*r, *g, *b))
+        .collect();
+    
+    // Calculate color variance
+    let avg_brightness = total_brightness / sample_size as u64;
+    let variance = color_counts.len() as f64 / 256.0; // Normalized variance
+    
+    // Dark mode detection
+    let dark_ratio = dark_pixels as f64 / sample_size as f64;
+    let is_dark_mode = dark_ratio > 0.6 || avg_brightness < 100;
+    
+    // Simple layout detection (check for regular patterns)
+    // This is a simplified version - full implementation would use edge detection
+    let has_grid_layout = variance > 0.3 && color_counts.len() > 20;
+    let has_linear_layout = variance < 0.2 && color_counts.len() < 10;
+    
+    // Estimate text density based on color patterns
+    // High contrast regions (many distinct colors) suggest text
+    // Low contrast (few colors) suggests solid backgrounds or images
+    let text_density = if variance > 0.4 { 
+        0.7 // High variance = likely text/UI
+    } else if variance > 0.25 { 
+        0.5 // Medium variance = mixed content
+    } else if variance > 0.15 {
+        0.3 // Lower variance = some text
+    } else { 
+        0.1 // Very low variance = mostly solid/image
+    };
+    
+    // UI elements detection (many distinct color regions = UI components)
+    let has_ui_elements = color_counts.len() > 25 && variance > 0.25;
+    
+    // Code blocks (monospace-like: low color variance, but structured)
+    // Code typically has consistent background with text
+    let has_code_blocks = variance < 0.2 && color_counts.len() < 15 && text_density > 0.3;
+    
+    // Images/photos (high color variance, many colors, low text structure)
+    let has_images = variance > 0.45 && color_counts.len() > 40 && text_density < 0.25;
+    
+    // Calculate confidence based on how clear the features are
+    let confidence = if has_code_blocks { 0.8 }
+        else if has_grid_layout && text_density > 0.4 { 0.75 }
+        else if has_images { 0.7 }
+        else if has_ui_elements { 0.65 }
+        else { 0.5 };
+    
+    VisualFeatures {
+        dominant_colors,
+        color_variance: variance,
+        is_dark_mode,
+        text_density,
+        has_grid_layout,
+        has_linear_layout,
+        has_ui_elements,
+        has_code_blocks,
+        has_images,
+        confidence,
+    }
+}
+
+fn classify_from_features(features: &VisualFeatures) -> Vec<String> {
+    let mut tags = Vec::new();
+    
+    // Only return tags if confidence is reasonable
+    // Low confidence means we should fall back to OCR-based detection
+    if features.confidence < 0.5 {
+        return tags; // Empty - let OCR handle it
+    }
+    
+    // Code detection (high confidence) - monospace, structured, consistent colors
+    if features.has_code_blocks && features.confidence >= 0.7 {
+        tags.push("Code".to_string());
+        return tags;
+    }
+    
+    // Messages detection (grid layout + high text density)
+    // Messages typically have many small text regions (bubbles)
+    if features.has_grid_layout && features.text_density > 0.5 && features.confidence >= 0.7 {
+        tags.push("Messages".to_string());
+        return tags;
+    }
+    
+    // Browser detection (UI elements + medium text density)
+    // Browsers have UI chrome + content area
+    if features.has_ui_elements && features.text_density > 0.3 && features.text_density < 0.6 && features.confidence >= 0.65 {
+        tags.push("Browser".to_string());
+        return tags;
+    }
+    
+    // Images detection (high color variance, low text, many colors)
+    if features.has_images && features.confidence >= 0.7 {
+        tags.push("Images".to_string());
+        return tags;
+    }
+    
+    // Design detection (high color variance, UI elements, structured)
+    // Design tools have UI + design elements
+    if features.color_variance > 0.35 && features.has_ui_elements && !features.has_images && features.confidence >= 0.65 {
+        tags.push("Design".to_string());
+        return tags;
+    }
+    
+    // Terminal detection (dark mode + linear layout + medium text)
+    // Terminals are typically dark with monospace text
+    if features.is_dark_mode && features.has_linear_layout && features.text_density > 0.35 && features.confidence >= 0.65 {
+        tags.push("Terminal".to_string());
+        return tags;
+    }
+    
+    tags
+}
+
+// Enhanced detection with multiple passes and confidence scoring
+fn detect_collections_enhanced(text: &str) -> Vec<String> {
+    let text_trimmed = text.trim();
+    
+    // First pass: standard detection
+    let mut tags = detect_collections(text);
+    
+    // If we got tags, return them
+    if !tags.is_empty() {
+        return tags;
+    }
+    
+    // Second pass: try with cleaned text
+    let cleaned = clean_ocr_text(text);
+    if cleaned != text && !cleaned.trim().is_empty() {
+        tags = detect_collections(&cleaned);
+        if !tags.is_empty() {
+            return tags;
+        }
+    }
+    
+    // Third pass: check for very specific patterns that might have been missed
+    let text_lower = text_trimmed.to_lowercase();
+    let word_count = text_trimmed.split_whitespace().count();
+    let char_count = text_trimmed.len();
+    
+    // Check for code patterns that might have been missed
+    if text.contains("function") || text.contains("const ") || text.contains("let ") || 
+       text.contains("class ") || text.contains("import ") || text.contains("def ") {
+        if text.contains("{") || text.contains("}") || text.contains("=>") {
+            return vec!["Code".to_string()];
+        }
+    }
+    
+    // Check for URLs that might indicate browser
+    if text.contains("http://") || text.contains("https://") || text.contains("www.") {
+        return vec!["Browser".to_string()];
+    }
+    
+    // Check for terminal prompts (must be strict - require multiple indicators)
+    let prompt_pattern = Regex::new(r"(?m)^[\$~>]\s|[\$~>]\s+").unwrap();
+    let has_prompts = prompt_pattern.is_match(text);
+    let command_pattern = Regex::new(r"\b(cd|ls|git|npm|cargo|python|node|docker|kubectl|ssh|sudo)\s+").unwrap();
+    let has_commands = command_pattern.is_match(text);
+    let has_multiple_lines = text.matches("\n").count() >= 2;
+    
+    // Only tag as terminal if we have strong indicators (prompts + commands, or prompts + multiple lines)
+    if (has_prompts && has_commands) || (has_prompts && has_multiple_lines) {
+        return vec!["Terminal".to_string()];
+    }
+    
+    // Check for error messages
+    if text_lower.contains("error") || text_lower.contains("exception") || 
+       text_lower.contains("failed") || text_lower.contains("traceback") {
+        return vec!["Errors".to_string()];
+    }
+    
+    // Check for prices/receipts
+    if text.contains("$") && (text_lower.contains("total") || text_lower.contains("subtotal")) {
+        return vec!["Receipts".to_string()];
+    }
+    
+    // If minimal text, tag as Images
+    if char_count < 50 || word_count < 10 {
+        return vec!["Images".to_string()];
+    }
+    
+    tags
+}
+
+// Update tags for an entry in the database
+fn update_entry_tags(app: &AppHandle, path: &str, tags: &[String]) {
+    let conn = match init_database(app) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[TAG-PIPELINE] Failed to init DB: {}", e);
+            return;
+        }
+    };
+    
+    let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let now_str = now.to_string();
+    
+    if let Err(e) = conn.execute(
+        "UPDATE entries SET tags = ?1, updated_at = ?2 WHERE path = ?3",
+        rusqlite::params![tags_json, now_str, path]
+    ) {
+        eprintln!("[TAG-PIPELINE] Failed to update tags for {}: {}", path, e);
+    } else {
+        // Emit event to frontend that tags were updated
+        if let Err(e) = app.emit("tags-updated", serde_json::json!({
+            "path": path,
+            "tags": tags
+        })) {
+            eprintln!("[TAG-PIPELINE] Failed to emit tags-updated event: {}", e);
+        }
+    }
 }
 
 fn extract_urls_and_emails(text: &str) -> (Vec<String>, Vec<String>) {
@@ -1454,8 +1828,129 @@ fn init_database(app: &AppHandle) -> SqlResult<Connection> {
         }
     }
     
+    // CRITICAL: Fix any entries without tags (should never happen, but safety check)
+    fix_entries_without_tags(&conn);
+    
+    // Convert all "Documents" tags to "Images" (all screenshots are images)
+    convert_documents_to_images(&conn);
+    
     println!("[DB] Database initialized at: {}", db_path.display());
     Ok(conn)
+}
+
+// Fix entries without tags - ensures database integrity
+fn fix_entries_without_tags(conn: &Connection) {
+    let mut stmt = match conn.prepare("SELECT path, text FROM entries WHERE tags IS NULL OR tags = '' OR tags = '[]'") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[DB-FIX] Failed to prepare query: {}", e);
+            return;
+        }
+    };
+    
+    let rows = match stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[DB-FIX] Failed to query: {}", e);
+            return;
+        }
+    };
+    
+    let mut fixed = 0;
+    for row in rows {
+        let (path, text) = match row {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[DB-FIX] Row error: {}", e);
+                continue;
+            }
+        };
+        
+        // Assign fallback tag - always use "Images" since all screenshots are images
+        let fallback_tag = "Images";
+        
+        let tags_json = format!(r#"["{}"]"#, fallback_tag);
+        
+        if let Err(e) = conn.execute(
+            "UPDATE entries SET tags = ?1 WHERE path = ?2",
+            rusqlite::params![tags_json, path]
+        ) {
+            eprintln!("[DB-FIX] Failed to fix {}: {}", path, e);
+        } else {
+            fixed += 1;
+        }
+    }
+    
+    if fixed > 0 {
+        println!("[DB-FIX] ✅ Fixed {} entries without tags", fixed);
+    }
+}
+
+// Convert all "Documents" tags to "Images" - all screenshots are images
+fn convert_documents_to_images(conn: &Connection) {
+    // Find all entries with "Documents" tag
+    let mut stmt = match conn.prepare("SELECT path, tags FROM entries WHERE tags LIKE '%Documents%'") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[DB-FIX] Failed to prepare Documents query: {}", e);
+            return;
+        }
+    };
+    
+    let rows = match stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[DB-FIX] Failed to query Documents: {}", e);
+            return;
+        }
+    };
+    
+    let mut converted = 0;
+    for row in rows {
+        let (path, tags_json) = match row {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[DB-FIX] Row error: {}", e);
+                continue;
+            }
+        };
+        
+        // Parse tags JSON and replace "Documents" with "Images"
+        let mut tags: Vec<String> = match serde_json::from_str(&tags_json) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        
+        // Replace "Documents" with "Images"
+        let mut updated = false;
+        for tag in &mut tags {
+            if *tag == "Documents" {
+                *tag = "Images".to_string();
+                updated = true;
+            }
+        }
+        
+        // If we updated, save back to database
+        if updated {
+            let new_tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
+            if let Err(e) = conn.execute(
+                "UPDATE entries SET tags = ?1 WHERE path = ?2",
+                rusqlite::params![new_tags_json, path]
+            ) {
+                eprintln!("[DB-FIX] Failed to convert Documents tag for {}: {}", path, e);
+            } else {
+                converted += 1;
+            }
+        }
+    }
+    
+    if converted > 0 {
+        println!("[DB-FIX] ✅ Converted {} entries from Documents to Images", converted);
+    }
 }
 
 fn save_entry_to_db(app: &AppHandle, path: &str, text: &str, created_at: &str) -> SqlResult<()> {
@@ -1466,14 +1961,24 @@ fn save_entry_to_db(app: &AppHandle, path: &str, text: &str, created_at: &str) -
         .as_secs();
     let now_str = now.to_string();
     
-    // Auto-detect tags
-    // If text is empty or very minimal, it's likely an image/photo
-    let tags = if text.trim().is_empty() || text.trim().len() < 10 {
-        vec!["Images".to_string()]
+    // Assign tags IMMEDIATELY (synchronously) to ensure every entry has tags
+    // This prevents entries from appearing without tags in the UI
+    let text_len = text.trim().len();
+    let initial_tags = if text_len == 0 || text_len < 10 {
+        vec!["Images".to_string()] // No/minimal text = Images
     } else {
+        // Try quick detection, but don't block - will refine asynchronously
         detect_collections(text)
     };
-    let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
+    
+    // If quick detection failed, assign fallback - always use "Images"
+    let tags_to_save = if initial_tags.is_empty() {
+        vec!["Images".to_string()]
+    } else {
+        initial_tags
+    };
+    
+    let tags_json = serde_json::to_string(&tags_to_save).unwrap_or_else(|_| "[]".to_string());
     
     // Extract URLs and emails
     let (urls, emails) = extract_urls_and_emails(text);
@@ -1489,11 +1994,20 @@ fn save_entry_to_db(app: &AppHandle, path: &str, text: &str, created_at: &str) -
         rusqlite::params![path, text, created_at, now_str, now_str, tags_json, urls_json, emails_json, perceptual_hash],
     )?;
     
-    if !tags.is_empty() {
-        println!("[DB] ✅ Saved entry: {} ({} chars) - Tags: {:?}", path, text.len(), tags);
-    } else {
-        println!("[DB] ✅ Saved entry: {} ({} chars)", path, text.len());
-    }
+    // Refine tags asynchronously (visual classification, enhanced detection)
+    // Initial tags are already saved above, so entry won't appear without tags
+    let app_for_tagging = app.clone();
+    let path_for_tagging = path.to_string();
+    let text_for_tagging = text.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        // Small delay to ensure DB write is complete
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Refine tags with visual classification and enhanced detection
+        // This will update tags if better classification is found
+        process_tags_for_entry(&app_for_tagging, &path_for_tagging, &text_for_tagging);
+    });
+    
+    println!("[DB] ✅ Saved entry: {} ({} chars) - Tags will be processed asynchronously", path, text.len());
     
     if !urls.is_empty() {
         println!("[DB]   Found {} URLs: {:?}", urls.len(), urls);
@@ -2112,6 +2626,42 @@ fn load_all_entries(app: AppHandle) -> Result<Vec<DbEntry>, String> {
         .map_err(|e| format!("Failed to load entries: {}", e))
 }
 
+#[derive(Serialize)]
+struct FileMetadata {
+    path: String,
+    size: u64,
+    created_at: String,
+}
+
+#[tauri::command]
+fn get_file_metadata(paths: Vec<String>) -> Result<Vec<FileMetadata>, String> {
+    let mut metadata = Vec::new();
+    
+    for path_str in paths {
+        let path = PathBuf::from(&path_str);
+        
+        if let Ok(meta) = fs::metadata(&path) {
+            let size = meta.len();
+            let created_at = get_file_created_at(&path)
+                .unwrap_or_else(|| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        .to_string()
+                });
+            
+            metadata.push(FileMetadata {
+                path: path_str,
+                size,
+                created_at,
+            });
+        }
+    }
+    
+    Ok(metadata)
+}
+
 #[tauri::command]
 fn find_similar_screenshots(app: AppHandle, threshold: Option<u32>) -> Result<Vec<Vec<String>>, String> {
     let conn = init_database(&app)
@@ -2209,16 +2759,16 @@ pub fn run() {
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
                     if event.state == ShortcutState::Pressed {
-                        // Check if it's Cmd+Shift+F (or Ctrl+Shift+F on Windows/Linux)
-                        #[cfg(target_os = "macos")]
-                        let is_cmd_shift_f = shortcut.matches(Modifiers::META | Modifiers::SHIFT, Code::KeyF);
-                        #[cfg(not(target_os = "macos"))]
-                        let is_cmd_shift_f = shortcut.matches(Modifiers::CONTROL | Modifiers::SHIFT, Code::KeyF);
+                        // Check for Cmd+Shift+F on macOS or Ctrl+Shift+F on Windows/Linux
+                        // Also support Ctrl+Shift+F on macOS for users who prefer it
+                        let is_cmd_shift_f = shortcut.matches(Modifiers::META | Modifiers::SHIFT, Code::KeyF) ||
+                                            shortcut.matches(Modifiers::CONTROL | Modifiers::SHIFT, Code::KeyF);
                         
                         if is_cmd_shift_f {
+                            println!("[SHORTCUT] Quick search triggered!");
                             let app_handle = app.app_handle().clone();
                             if let Err(e) = open_quick_search(app_handle) {
-                                eprintln!("Failed to open quick search: {}", e);
+                                eprintln!("[SHORTCUT] Failed to open quick search: {}", e);
                             }
                         }
                     }
@@ -2231,20 +2781,65 @@ pub fn run() {
             load_all_entries,
             find_similar_screenshots,
             open_quick_search,
-            reprocess_all_tags,
-            compute_missing_hashes
+            compute_missing_hashes,
+            reprocess_all_with_visual,
+            get_file_metadata
         ])
         .setup(|app| {
             // Verify Tesseract on startup
             verify_tesseract();
             start_watcher(app.app_handle().clone());
             
-            // Register the global shortcut
+            // Register the global shortcuts (both Cmd and Ctrl for macOS compatibility)
             let app_handle = app.app_handle().clone();
-            match app_handle.global_shortcut().register("CommandOrControl+Shift+F") {
+            
+            // Register Cmd+Shift+F (macOS standard)
+            match app_handle.global_shortcut().register("Command+Shift+F") {
                 Ok(_) => println!("[SHORTCUT] ✅ Registered Cmd+Shift+F for quick search"),
-                Err(e) => eprintln!("[SHORTCUT] ❌ Failed to register global shortcut: {}", e),
+                Err(e) => eprintln!("[SHORTCUT] ❌ Failed to register Cmd+Shift+F: {}", e),
             }
+            
+            // Also register Ctrl+Shift+F (for users who prefer it, or Windows/Linux)
+            match app_handle.global_shortcut().register("Control+Shift+F") {
+                Ok(_) => println!("[SHORTCUT] ✅ Registered Ctrl+Shift+F for quick search"),
+                Err(e) => eprintln!("[SHORTCUT] ⚠️ Failed to register Ctrl+Shift+F: {} (may not be needed)", e),
+            }
+            
+            // Automatically process tags for entries without tags on startup (in background)
+            let app_handle_for_reprocess = app.app_handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                // Small delay to let the app finish initializing
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                
+                println!("[STARTUP] 🔄 Processing tags for entries without tags...");
+                match reprocess_entries_without_tags_enhanced(app_handle_for_reprocess.clone()) {
+                    Ok(count) => {
+                        if count > 0 {
+                            println!("[STARTUP] ✅ Processed tags for {} entries", count);
+                        } else {
+                            println!("[STARTUP] ✅ All entries already have tags");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[STARTUP] ⚠️ Failed to process tags: {}", e);
+                    }
+                }
+                
+                // Also compute missing perceptual hashes in background
+                println!("[STARTUP] 🔄 Computing missing perceptual hashes...");
+                match compute_missing_hashes(app_handle_for_reprocess) {
+                    Ok(count) => {
+                        if count > 0 {
+                            println!("[STARTUP] ✅ Computed {} missing perceptual hashes", count);
+                        } else {
+                            println!("[STARTUP] ✅ All entries already have perceptual hashes");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[STARTUP] ⚠️ Failed to compute missing hashes: {}", e);
+                    }
+                }
+            });
             
             Ok(())
         })
@@ -2252,13 +2847,13 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-#[tauri::command]
-fn reprocess_all_tags(app: AppHandle) -> Result<usize, String> {
+// Enhanced reprocessing using the separate tagging pipeline (with visual classification)
+fn reprocess_entries_without_tags_enhanced(app: AppHandle) -> Result<usize, String> {
     let conn = init_database(&app)
         .map_err(|e| format!("DB error: {}", e))?;
     
-    // Get ALL entries to reprocess with improved detection logic
-    let mut stmt = conn.prepare("SELECT path, text FROM entries")
+    // Get entries without tags or with empty tags
+    let mut stmt = conn.prepare("SELECT path, text FROM entries WHERE tags IS NULL OR tags = '' OR tags = '[]'")
         .map_err(|e| format!("Query error: {}", e))?;
     
     let rows = stmt.query_map([], |row| {
@@ -2266,36 +2861,51 @@ fn reprocess_all_tags(app: AppHandle) -> Result<usize, String> {
     }).map_err(|e| format!("Query map error: {}", e))?;
     
     let mut updated = 0;
-    let mut with_tags = 0;
-    let mut without_tags = 0;
     
     for row in rows {
         let (path, text) = row.map_err(|e| format!("Row error: {}", e))?;
         
-        // Detect tags from text using improved detection logic
-        let tags = detect_collections(&text);
-        let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
+        // Use the same pipeline as new entries: visual classification first, then OCR
+        // This ensures old images get the benefit of visual analysis
+        // This function guarantees every entry gets at least one tag
+        process_tags_for_entry(&app, &path, &text);
+        updated += 1;
+    }
+    
+    Ok(updated)
+}
+
+// Reprocess ALL entries with visual classification (for improving existing tags)
+#[tauri::command]
+fn reprocess_all_with_visual(app: AppHandle) -> Result<usize, String> {
+    let conn = init_database(&app)
+        .map_err(|e| format!("DB error: {}", e))?;
+    
+    // Get ALL entries to reprocess with visual classification
+    let mut stmt = conn.prepare("SELECT path, text FROM entries")
+        .map_err(|e| format!("Query error: {}", e))?;
+    
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }).map_err(|e| format!("Query map error: {}", e))?;
+    
+    let mut processed = 0;
+    
+    for row in rows {
+        let (path, text) = row.map_err(|e| format!("Row error: {}", e))?;
         
-        // Update the entry with new tags (always update, even if tags changed)
-        if let Err(e) = conn.execute(
-            "UPDATE entries SET tags = ?1 WHERE path = ?2",
-            rusqlite::params![tags_json, path]
-        ) {
-            eprintln!("[REPROCESS] Failed to update {}: {}", path, e);
-        } else {
-            updated += 1;
-            if !tags.is_empty() {
-                with_tags += 1;
-                println!("[REPROCESS] ✅ Updated {}: {:?}", path, tags);
-            } else {
-                without_tags += 1;
-            }
+        // Reprocess with visual classification (will update tags if better match found)
+        // This function guarantees every entry gets at least one tag
+        process_tags_for_entry(&app, &path, &text);
+        processed += 1;
+        
+        if processed % 10 == 0 {
+            println!("[REPROCESS-ALL] Processed {} entries...", processed);
         }
     }
     
-    println!("[REPROCESS] ✅ Reprocessed {} entries total ({} with tags, {} without tags)", 
-             updated, with_tags, without_tags);
-    Ok(updated)
+    println!("[REPROCESS-ALL] ✅ Reprocessed {} entries with visual classification", processed);
+    Ok(processed)
 }
 
 #[tauri::command]
