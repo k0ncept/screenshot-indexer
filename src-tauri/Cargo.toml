@@ -30,3 +30,4 @@ image = "0.25"
 regex = "1.11"
 rusqlite = { version = "0.32", features = ["bundled"] }
 image_hasher = "3.0"
+chrono = "0.4"

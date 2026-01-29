@@ -649,48 +649,8 @@ fn detect_collections(text: &str) -> Vec<String> {
         tags.push("Errors".to_string());
     }
     
-    // STEP 8: DOCUMENTS DETECTION (Only if NOT Messages and no other tags)
-    // IMPORTANT: Double-check that this is NOT a message
-    let is_likely_message = has_any_timestamp || has_message_apps || has_read_receipts || 
-                           has_chat_words || has_message_bubbles || has_date_headers ||
-                           has_questions || has_casual_greetings;
-    
-    // Only proceed with Documents if we're confident it's NOT a message and no other tags
-    if !is_likely_message && tags.is_empty() {
-        let word_count = text.split_whitespace().count();
-        let has_paragraphs = text.split("\n\n").count() > 2 || text.matches("\n").count() > 5;
-        let has_sentences = text.matches('.').count() > 3 || text.matches('!').count() > 1 || text.matches('?').count() > 1;
-        
-        // Document-like patterns (formal writing)
-        let document_patterns = ["chapter", "section", "paragraph", "article", "document", 
-                                 "page", "heading", "title", "author", "date", "published",
-                                 "abstract", "introduction", "conclusion", "references",
-                                 "table of contents", "bibliography"];
-        let has_doc_patterns = document_patterns.iter().any(|pattern| text_lower.contains(pattern));
-        
-        // Check for structured formatting (lists, numbered items)
-        let numbered_list_pattern = Regex::new(r"(?m)^\d+\.\s").unwrap();
-        let has_lists = text.contains("•") || text.contains("- ") || 
-                       numbered_list_pattern.is_match(text) ||
-                       text.matches("\n- ").count() > 2 || text.matches("\n• ").count() > 2;
-        
-        // Formal writing indicators (not casual/conversational)
-        let has_formal_language = text_lower.contains("therefore") || text_lower.contains("however") ||
-                                 text_lower.contains("furthermore") || text_lower.contains("moreover") ||
-                                 text_lower.contains("in conclusion") || text_lower.contains("in summary");
-        
-        // Plain text document indicators - must be substantial AND structured
-        let is_plain_text = word_count > 50 && // More words than typical messages
-                           (has_paragraphs || has_sentences) && 
-                           !has_urls && // Not a browser screenshot
-                           !has_code_keywords && // Not code
-                           !has_prompts && // Not terminal
-                           (has_doc_patterns || has_lists || has_formal_language); // Must have document structure
-        
-        // Documents detection removed - all screenshots are images
-        // If nothing else matches, will fallback to "Images" tag
-        // (This block intentionally does nothing - documents will be tagged as Images)
-    }
+    // STEP 8: DOCUMENTS DETECTION REMOVED
+    // All screenshots are images; documents with text will fall back to "Images".
     
     // STEP 9: IMAGES/PHOTOS DETECTION (Fallback - very little or no text)
     // Check if this is primarily an image with minimal text
@@ -1790,6 +1750,8 @@ fn init_database(app: &AppHandle) -> SqlResult<Connection> {
         ("urls", "TEXT"),
         ("emails", "TEXT"),
         ("perceptual_hash", "BLOB"),
+        ("pinned", "INTEGER DEFAULT 0"),
+        ("custom_tags", "TEXT"),
     ];
     
     for (col_name, col_type) in columns_to_add {
@@ -1828,6 +1790,25 @@ fn init_database(app: &AppHandle) -> SqlResult<Connection> {
         }
     }
     
+    // Create index on pinned column
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pinned ON entries(pinned)",
+        [],
+    )?;
+    
+    // Create saved_searches table for Smart Albums feature
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS saved_searches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            query TEXT NOT NULL DEFAULT '',
+            collection_filter TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )",
+        [],
+    )?;
+    
     // CRITICAL: Fix any entries without tags (should never happen, but safety check)
     fix_entries_without_tags(&conn);
     
@@ -1860,7 +1841,7 @@ fn fix_entries_without_tags(conn: &Connection) {
     
     let mut fixed = 0;
     for row in rows {
-        let (path, text) = match row {
+        let (path, _text) = match row {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("[DB-FIX] Row error: {}", e);
@@ -2027,11 +2008,23 @@ struct DbEntry {
     tags: Option<String>,
     urls: Option<String>,
     emails: Option<String>,
+    pinned: bool,
+    custom_tags: Option<String>,
+}
+
+#[derive(Clone, Serialize, serde::Deserialize)]
+struct SavedSearch {
+    id: i64,
+    name: String,
+    query: String,
+    collection_filter: Option<String>,
+    created_at: String,
+    updated_at: String,
 }
 
 fn load_all_entries_from_db(app: &AppHandle) -> SqlResult<Vec<DbEntry>> {
     let conn = init_database(app)?;
-    let mut stmt = conn.prepare("SELECT path, text, created_at, tags, urls, emails FROM entries ORDER BY created_at DESC")?;
+    let mut stmt = conn.prepare("SELECT path, text, created_at, tags, urls, emails, COALESCE(pinned, 0), custom_tags FROM entries ORDER BY pinned DESC, created_at DESC")?;
     let rows = stmt.query_map([], |row| {
         Ok(DbEntry {
             path: row.get(0)?,
@@ -2040,6 +2033,8 @@ fn load_all_entries_from_db(app: &AppHandle) -> SqlResult<Vec<DbEntry>> {
             tags: row.get(3).ok(),
             urls: row.get(4).ok(),
             emails: row.get(5).ok(),
+            pinned: row.get::<_, i64>(6).unwrap_or(0) == 1,
+            custom_tags: row.get(7).ok(),
         })
     })?;
     
@@ -2783,7 +2778,19 @@ pub fn run() {
             open_quick_search,
             compute_missing_hashes,
             reprocess_all_with_visual,
-            get_file_metadata
+            get_file_metadata,
+            // Smart Albums / Saved Searches
+            save_search,
+            load_saved_searches,
+            delete_saved_search,
+            update_saved_search,
+            // Pinning
+            toggle_pin,
+            get_pinned_entries,
+            // Custom Tags
+            add_custom_tag,
+            remove_custom_tag,
+            get_all_custom_tags
         ])
         .setup(|app| {
             // Verify Tesseract on startup
@@ -2873,6 +2880,266 @@ fn reprocess_entries_without_tags_enhanced(app: AppHandle) -> Result<usize, Stri
     }
     
     Ok(updated)
+}
+
+// ============== SMART ALBUMS / SAVED SEARCHES ==============
+
+#[tauri::command]
+fn save_search(app: AppHandle, name: String, query: String, collection_filter: Option<String>) -> Result<SavedSearch, String> {
+    let conn = init_database(&app)
+        .map_err(|e| format!("Database error: {}", e))?;
+    
+    let now = chrono::Utc::now().to_rfc3339();
+    
+    conn.execute(
+        "INSERT INTO saved_searches (name, query, collection_filter, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![name, query, collection_filter, now, now],
+    ).map_err(|e| format!("Failed to save search: {}", e))?;
+    
+    let id = conn.last_insert_rowid();
+    
+    println!("[SAVED_SEARCH] ✅ Created saved search '{}' (id: {})", name, id);
+    
+    Ok(SavedSearch {
+        id,
+        name,
+        query,
+        collection_filter,
+        created_at: now.clone(),
+        updated_at: now,
+    })
+}
+
+#[tauri::command]
+fn load_saved_searches(app: AppHandle) -> Result<Vec<SavedSearch>, String> {
+    let conn = init_database(&app)
+        .map_err(|e| format!("Database error: {}", e))?;
+    
+    let mut stmt = conn.prepare("SELECT id, name, query, collection_filter, created_at, updated_at FROM saved_searches ORDER BY name ASC")
+        .map_err(|e| format!("Failed to prepare query: {}", e))?;
+    
+    let rows = stmt.query_map([], |row| {
+        Ok(SavedSearch {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            query: row.get(2)?,
+            collection_filter: row.get(3).ok(),
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
+        })
+    }).map_err(|e| format!("Failed to query: {}", e))?;
+    
+    let mut searches = Vec::new();
+    for row in rows {
+        if let Ok(search) = row {
+            searches.push(search);
+        }
+    }
+    
+    println!("[SAVED_SEARCH] ✅ Loaded {} saved searches", searches.len());
+    Ok(searches)
+}
+
+#[tauri::command]
+fn delete_saved_search(app: AppHandle, id: i64) -> Result<(), String> {
+    let conn = init_database(&app)
+        .map_err(|e| format!("Database error: {}", e))?;
+    
+    conn.execute("DELETE FROM saved_searches WHERE id = ?1", rusqlite::params![id])
+        .map_err(|e| format!("Failed to delete saved search: {}", e))?;
+    
+    println!("[SAVED_SEARCH] ✅ Deleted saved search id: {}", id);
+    Ok(())
+}
+
+#[tauri::command]
+fn update_saved_search(app: AppHandle, id: i64, name: String, query: String, collection_filter: Option<String>) -> Result<SavedSearch, String> {
+    let conn = init_database(&app)
+        .map_err(|e| format!("Database error: {}", e))?;
+    
+    let now = chrono::Utc::now().to_rfc3339();
+    
+    conn.execute(
+        "UPDATE saved_searches SET name = ?1, query = ?2, collection_filter = ?3, updated_at = ?4 WHERE id = ?5",
+        rusqlite::params![name, query, collection_filter, now, id],
+    ).map_err(|e| format!("Failed to update saved search: {}", e))?;
+    
+    // Fetch the created_at from the database
+    let created_at: String = conn.query_row(
+        "SELECT created_at FROM saved_searches WHERE id = ?1",
+        rusqlite::params![id],
+        |row| row.get(0),
+    ).map_err(|e| format!("Failed to get saved search: {}", e))?;
+    
+    println!("[SAVED_SEARCH] ✅ Updated saved search '{}' (id: {})", name, id);
+    
+    Ok(SavedSearch {
+        id,
+        name,
+        query,
+        collection_filter,
+        created_at,
+        updated_at: now,
+    })
+}
+
+// ============== PINNING ==============
+
+#[tauri::command]
+fn toggle_pin(app: AppHandle, path: String) -> Result<bool, String> {
+    let conn = init_database(&app)
+        .map_err(|e| format!("Database error: {}", e))?;
+    
+    // Get current pinned state
+    let current: i64 = conn.query_row(
+        "SELECT COALESCE(pinned, 0) FROM entries WHERE path = ?1",
+        rusqlite::params![path],
+        |row| row.get(0),
+    ).map_err(|e| format!("Entry not found: {}", e))?;
+    
+    let new_pinned = if current == 1 { 0 } else { 1 };
+    
+    conn.execute(
+        "UPDATE entries SET pinned = ?1 WHERE path = ?2",
+        rusqlite::params![new_pinned, path],
+    ).map_err(|e| format!("Failed to toggle pin: {}", e))?;
+    
+    let is_pinned = new_pinned == 1;
+    println!("[PIN] ✅ {} entry: {}", if is_pinned { "Pinned" } else { "Unpinned" }, path);
+    
+    Ok(is_pinned)
+}
+
+#[tauri::command]
+fn get_pinned_entries(app: AppHandle) -> Result<Vec<DbEntry>, String> {
+    let conn = init_database(&app)
+        .map_err(|e| format!("Database error: {}", e))?;
+    
+    let mut stmt = conn.prepare("SELECT path, text, created_at, tags, urls, emails, pinned, custom_tags FROM entries WHERE pinned = 1 ORDER BY created_at DESC")
+        .map_err(|e| format!("Failed to prepare query: {}", e))?;
+    
+    let rows = stmt.query_map([], |row| {
+        Ok(DbEntry {
+            path: row.get(0)?,
+            text: row.get(1)?,
+            at: row.get(2)?,
+            tags: row.get(3).ok(),
+            urls: row.get(4).ok(),
+            emails: row.get(5).ok(),
+            pinned: row.get::<_, i64>(6).unwrap_or(0) == 1,
+            custom_tags: row.get(7).ok(),
+        })
+    }).map_err(|e| format!("Failed to query: {}", e))?;
+    
+    let mut entries = Vec::new();
+    for row in rows {
+        if let Ok(entry) = row {
+            entries.push(entry);
+        }
+    }
+    
+    println!("[PIN] ✅ Loaded {} pinned entries", entries.len());
+    Ok(entries)
+}
+
+// ============== CUSTOM TAGS ==============
+
+#[tauri::command]
+fn add_custom_tag(app: AppHandle, path: String, tag: String) -> Result<Vec<String>, String> {
+    let conn = init_database(&app)
+        .map_err(|e| format!("Database error: {}", e))?;
+    
+    // Get current custom_tags
+    let current: Option<String> = conn.query_row(
+        "SELECT custom_tags FROM entries WHERE path = ?1",
+        rusqlite::params![path],
+        |row| row.get(0),
+    ).map_err(|e| format!("Entry not found: {}", e))?;
+    
+    // Parse existing tags or create empty vec
+    let mut tags: Vec<String> = current
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    
+    // Add tag if not already present
+    if !tags.contains(&tag) {
+        tags.push(tag.clone());
+        
+        let tags_json = serde_json::to_string(&tags)
+            .map_err(|e| format!("Failed to serialize tags: {}", e))?;
+        
+        conn.execute(
+            "UPDATE entries SET custom_tags = ?1 WHERE path = ?2",
+            rusqlite::params![tags_json, path],
+        ).map_err(|e| format!("Failed to add custom tag: {}", e))?;
+        
+        println!("[CUSTOM_TAG] ✅ Added tag '{}' to: {}", tag, path);
+    }
+    
+    Ok(tags)
+}
+
+#[tauri::command]
+fn remove_custom_tag(app: AppHandle, path: String, tag: String) -> Result<Vec<String>, String> {
+    let conn = init_database(&app)
+        .map_err(|e| format!("Database error: {}", e))?;
+    
+    // Get current custom_tags
+    let current: Option<String> = conn.query_row(
+        "SELECT custom_tags FROM entries WHERE path = ?1",
+        rusqlite::params![path],
+        |row| row.get(0),
+    ).map_err(|e| format!("Entry not found: {}", e))?;
+    
+    // Parse existing tags
+    let mut tags: Vec<String> = current
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    
+    // Remove tag
+    tags.retain(|t| t != &tag);
+    
+    let tags_json = serde_json::to_string(&tags)
+        .map_err(|e| format!("Failed to serialize tags: {}", e))?;
+    
+    conn.execute(
+        "UPDATE entries SET custom_tags = ?1 WHERE path = ?2",
+        rusqlite::params![tags_json, path],
+    ).map_err(|e| format!("Failed to remove custom tag: {}", e))?;
+    
+    println!("[CUSTOM_TAG] ✅ Removed tag '{}' from: {}", tag, path);
+    
+    Ok(tags)
+}
+
+#[tauri::command]
+fn get_all_custom_tags(app: AppHandle) -> Result<Vec<String>, String> {
+    let conn = init_database(&app)
+        .map_err(|e| format!("Database error: {}", e))?;
+    
+    let mut stmt = conn.prepare("SELECT custom_tags FROM entries WHERE custom_tags IS NOT NULL AND custom_tags != '[]'")
+        .map_err(|e| format!("Failed to prepare query: {}", e))?;
+    
+    let rows = stmt.query_map([], |row| {
+        row.get::<_, String>(0)
+    }).map_err(|e| format!("Failed to query: {}", e))?;
+    
+    let mut all_tags: HashSet<String> = HashSet::new();
+    for row in rows {
+        if let Ok(tags_json) = row {
+            if let Ok(tags) = serde_json::from_str::<Vec<String>>(&tags_json) {
+                for tag in tags {
+                    all_tags.insert(tag);
+                }
+            }
+        }
+    }
+    
+    let mut tags_vec: Vec<String> = all_tags.into_iter().collect();
+    tags_vec.sort();
+    
+    println!("[CUSTOM_TAG] ✅ Found {} unique custom tags", tags_vec.len());
+    Ok(tags_vec)
 }
 
 // Reprocess ALL entries with visual classification (for improving existing tags)

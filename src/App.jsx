@@ -418,6 +418,15 @@ function App() {
   const [showSimilar, setShowSimilar] = useState(false);
   const [similarGroups, setSimilarGroups] = useState([]);
   
+  // Smart Albums / Saved Searches state
+  const [savedSearches, setSavedSearches] = useState([]);
+  const [showSaveSearchModal, setShowSaveSearchModal] = useState(false);
+  const [newSearchName, setNewSearchName] = useState("");
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [allCustomTags, setAllCustomTags] = useState([]);
+  const [selectedSavedSearch, setSelectedSavedSearch] = useState(null);
+  const [customTagInput, setCustomTagInput] = useState("");
+  
   // Debug function - expose to window for console access
   useEffect(() => {
     window.debugChronicle = {
@@ -599,27 +608,34 @@ function App() {
     let collectionFiltered = entries;
     if (selectedCollection) {
       console.log("[FILTER] Filtering by collection:", selectedCollection);
-      collectionFiltered = entries.filter(entry => {
-        // Ensure tags is always an array
-        let tags = [];
-        try {
-          if (entry.tags) {
-            if (Array.isArray(entry.tags)) {
-              tags = entry.tags;
-            } else if (typeof entry.tags === 'string') {
-              tags = JSON.parse(entry.tags);
+      
+      // Special handling for pinned filter
+      if (selectedCollection === '__pinned__') {
+        collectionFiltered = entries.filter(entry => entry.pinned === true);
+        console.log("[FILTER] ✅ Filtered to", collectionFiltered.length, "pinned entries");
+      } else {
+        collectionFiltered = entries.filter(entry => {
+          // Ensure tags is always an array
+          let tags = [];
+          try {
+            if (entry.tags) {
+              if (Array.isArray(entry.tags)) {
+                tags = entry.tags;
+              } else if (typeof entry.tags === 'string') {
+                tags = JSON.parse(entry.tags);
+              }
             }
+          } catch (e) {
+            console.warn("[FILTER] Failed to parse tags for entry:", entry.path, e);
           }
-        } catch (e) {
-          console.warn("[FILTER] Failed to parse tags for entry:", entry.path, e);
-        }
-        
-        const hasTag = tags.includes(selectedCollection);
-        if (hasTag) {
-          console.log("[FILTER] ✅ Entry matches:", selectedCollection, "Tags:", tags, "Path:", entry.path.split('/').pop());
-        }
-        return hasTag;
-      });
+          
+          const hasTag = tags.includes(selectedCollection);
+          if (hasTag) {
+            console.log("[FILTER] ✅ Entry matches:", selectedCollection, "Tags:", tags, "Path:", entry.path.split('/').pop());
+          }
+          return hasTag;
+        });
+      }
       console.log("[FILTER] ✅ Filtered to", collectionFiltered.length, "entries for collection:", selectedCollection, "out of", entries.length, "total");
       
       // Debug: Show sample of entries with tags
@@ -961,7 +977,107 @@ function App() {
     }
   }, [viewerPath]);
 
-
+  // ============== SMART ALBUMS / SAVED SEARCHES ==============
+  
+  const handleSaveSearch = useCallback(async () => {
+    if (!newSearchName.trim()) {
+      setLastError("Please enter a name for the saved search");
+      return;
+    }
+    
+    try {
+      const search = await invoke("save_search", {
+        name: newSearchName.trim(),
+        query: query,
+        collectionFilter: selectedCollection
+      });
+      
+      setSavedSearches(prev => [...prev, search]);
+      setShowSaveSearchModal(false);
+      setNewSearchName("");
+      console.log("[SAVED_SEARCH] ✅ Created:", search.name);
+    } catch (error) {
+      console.error("[SAVED_SEARCH] Error:", error);
+      setLastError(`Failed to save search: ${String(error)}`);
+    }
+  }, [newSearchName, query, selectedCollection]);
+  
+  const handleDeleteSavedSearch = useCallback(async (id) => {
+    try {
+      await invoke("delete_saved_search", { id });
+      setSavedSearches(prev => prev.filter(s => s.id !== id));
+      if (selectedSavedSearch?.id === id) {
+        setSelectedSavedSearch(null);
+      }
+      console.log("[SAVED_SEARCH] ✅ Deleted id:", id);
+    } catch (error) {
+      console.error("[SAVED_SEARCH] Error:", error);
+      setLastError(`Failed to delete saved search: ${String(error)}`);
+    }
+  }, [selectedSavedSearch]);
+  
+  const handleApplySavedSearch = useCallback((search) => {
+    setQuery(search.query || "");
+    setSelectedCollection(search.collection_filter || null);
+    setSelectedSavedSearch(search);
+    console.log("[SAVED_SEARCH] Applied:", search.name);
+  }, []);
+  
+  // ============== PINNING ==============
+  
+  const handleTogglePin = useCallback(async (path) => {
+    try {
+      const isPinned = await invoke("toggle_pin", { path });
+      
+      setEntries(prev => prev.map(entry => 
+        entry.path === path ? { ...entry, pinned: isPinned } : entry
+      ));
+      
+      console.log("[PIN] ✅", isPinned ? "Pinned" : "Unpinned", path);
+    } catch (error) {
+      console.error("[PIN] Error:", error);
+      setLastError(`Failed to toggle pin: ${String(error)}`);
+    }
+  }, []);
+  
+  // ============== CUSTOM TAGS ==============
+  
+  const handleAddCustomTag = useCallback(async (path, tag) => {
+    if (!tag.trim()) return;
+    
+    try {
+      const updatedTags = await invoke("add_custom_tag", { path, tag: tag.trim() });
+      
+      setEntries(prev => prev.map(entry => 
+        entry.path === path ? { ...entry, customTags: updatedTags } : entry
+      ));
+      
+      // Update global custom tags list
+      if (!allCustomTags.includes(tag.trim())) {
+        setAllCustomTags(prev => [...prev, tag.trim()].sort());
+      }
+      
+      console.log("[CUSTOM_TAG] ✅ Added", tag, "to", path);
+    } catch (error) {
+      console.error("[CUSTOM_TAG] Error:", error);
+      setLastError(`Failed to add custom tag: ${String(error)}`);
+    }
+  }, [allCustomTags]);
+  
+  const handleRemoveCustomTag = useCallback(async (path, tag) => {
+    try {
+      const updatedTags = await invoke("remove_custom_tag", { path, tag });
+      
+      setEntries(prev => prev.map(entry => 
+        entry.path === path ? { ...entry, customTags: updatedTags } : entry
+      ));
+      
+      console.log("[CUSTOM_TAG] ✅ Removed", tag, "from", path);
+    } catch (error) {
+      console.error("[CUSTOM_TAG] Error:", error);
+      setLastError(`Failed to remove custom tag: ${String(error)}`);
+    }
+  }, []);
 
   // Load entries from database on app startup
   useEffect(() => {
@@ -1017,13 +1133,25 @@ function App() {
               atValue = isNaN(parsed.getTime()) ? new Date().toISOString() : parsed.toISOString();
             }
             
+            // Parse custom_tags
+            let customTags = [];
+            try {
+              if (entry.custom_tags) {
+                customTags = typeof entry.custom_tags === 'string' ? JSON.parse(entry.custom_tags) : (Array.isArray(entry.custom_tags) ? entry.custom_tags : []);
+              }
+            } catch (e) {
+              console.warn("[DB] Failed to parse custom_tags for entry:", entry.path, e);
+            }
+            
             return {
               path: entry.path,
               text: entry.text || "",
               at: atValue,
               tags: tags,
               urls: urls,
-              emails: emails
+              emails: emails,
+              pinned: entry.pinned || false,
+              customTags: customTags
             };
           });
           
@@ -1058,7 +1186,31 @@ function App() {
       }
     };
     
+    // Load saved searches
+    const loadSavedSearches = async () => {
+      try {
+        const searches = await invoke("load_saved_searches");
+        setSavedSearches(searches || []);
+        console.log("[SAVED_SEARCH] ✅ Loaded", searches?.length || 0, "saved searches");
+      } catch (error) {
+        console.error("[SAVED_SEARCH] Failed to load saved searches:", error);
+      }
+    };
+    
+    // Load all custom tags for autocomplete
+    const loadCustomTags = async () => {
+      try {
+        const tags = await invoke("get_all_custom_tags");
+        setAllCustomTags(tags || []);
+        console.log("[CUSTOM_TAG] ✅ Loaded", tags?.length || 0, "custom tags");
+      } catch (error) {
+        console.error("[CUSTOM_TAG] Failed to load custom tags:", error);
+      }
+    };
+    
     loadEntries();
+    loadSavedSearches();
+    loadCustomTags();
   }, []);
 
   useEffect(() => {
@@ -1775,6 +1927,19 @@ function App() {
           >
             All
           </button>
+          <button
+            onClick={() => setSelectedCollection('__pinned__')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition flex items-center gap-1 ${
+              selectedCollection === '__pinned__'
+                ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                : 'bg-slate-800/50 text-slate-300 border border-slate-700/50 hover:bg-slate-700/50'
+            }`}
+          >
+            <svg className="w-3 h-3" fill={selectedCollection === '__pinned__' ? "currentColor" : "none"} viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z" />
+            </svg>
+            Pinned {entries.filter(e => e.pinned).length > 0 && <span className="opacity-70">({entries.filter(e => e.pinned).length})</span>}
+          </button>
           {['Code', 'Messages', 'Design', 'Documents', 'Receipts', 'Browser', 'Terminal', 'Errors', 'Images'].map(collection => {
             const colors = {
               'Code': 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40',
@@ -1812,18 +1977,128 @@ function App() {
           })}
         </div>
         
+        {/* Saved Searches Panel */}
+        {savedSearches.length > 0 && (
+          <div className="mt-4 rounded-lg border border-slate-700/50 bg-slate-800/20 p-3">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-medium text-slate-400 uppercase tracking-wide">Saved Searches</span>
+              {selectedSavedSearch && (
+                <button
+                  onClick={() => {
+                    setSelectedSavedSearch(null);
+                    setQuery("");
+                    setSelectedCollection(null);
+                  }}
+                  className="text-[10px] text-slate-500 hover:text-slate-300"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {savedSearches.map(search => (
+                <div
+                  key={search.id}
+                  className={`group flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs cursor-pointer transition ${
+                    selectedSavedSearch?.id === search.id
+                      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                      : 'bg-slate-700/30 text-slate-300 border border-slate-600/30 hover:bg-slate-700/50'
+                  }`}
+                  onClick={() => handleApplySavedSearch(search)}
+                >
+                  <span>{search.name}</span>
+                  {search.collection_filter && (
+                    <span className="text-[9px] opacity-60">({search.collection_filter})</span>
+                  )}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleDeleteSavedSearch(search.id);
+                    }}
+                    className="opacity-0 group-hover:opacity-100 ml-1 text-slate-500 hover:text-rose-400 transition"
+                  >
+                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        
         {/* Search Bar */}
-        <div className="mt-4">
-          <input
-            ref={searchInputRef}
-            type="text"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search screenshots by text or filename..."
-            className="w-full rounded-lg border border-slate-700/50 bg-slate-800/30 px-4 py-2.5 text-sm text-slate-200 placeholder:text-slate-500 focus:border-slate-600/50 focus:outline-none focus:bg-slate-800/50"
-            autoFocus={false}
-          />
+        <div className="mt-4 flex gap-2">
+          <div className="flex-1 relative">
+            <input
+              ref={searchInputRef}
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search screenshots by text or filename..."
+              className="w-full rounded-lg border border-slate-700/50 bg-slate-800/30 px-4 py-2.5 text-sm text-slate-200 placeholder:text-slate-500 focus:border-slate-600/50 focus:outline-none focus:bg-slate-800/50"
+              autoFocus={false}
+            />
+          </div>
+          {(query || selectedCollection) && (
+            <button
+              onClick={() => setShowSaveSearchModal(true)}
+              className="px-3 py-2 rounded-lg text-xs font-medium bg-slate-700/50 text-slate-300 border border-slate-600/50 hover:bg-slate-600/50 transition flex items-center gap-1.5"
+              title="Save this search"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z" />
+              </svg>
+              Save
+            </button>
+          )}
         </div>
+        
+        {/* Save Search Modal */}
+        {showSaveSearchModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setShowSaveSearchModal(false)}>
+            <div className="bg-[#0f1114] rounded-xl border border-slate-700/70 p-6 w-96 shadow-2xl" onClick={e => e.stopPropagation()}>
+              <h3 className="text-lg font-semibold text-slate-100 mb-4">Save Search</h3>
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1.5">Name</label>
+                  <input
+                    type="text"
+                    value={newSearchName}
+                    onChange={(e) => setNewSearchName(e.target.value)}
+                    placeholder="e.g., Code Screenshots"
+                    className="w-full rounded-lg border border-slate-700/50 bg-slate-800/30 px-3 py-2 text-sm text-slate-200 placeholder:text-slate-500 focus:border-slate-600/50 focus:outline-none"
+                    autoFocus
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleSaveSearch();
+                      if (e.key === 'Escape') setShowSaveSearchModal(false);
+                    }}
+                  />
+                </div>
+                <div className="text-xs text-slate-500">
+                  {query && <div>Query: "{query}"</div>}
+                  {selectedCollection && <div>Collection: {selectedCollection}</div>}
+                  {!query && !selectedCollection && <div className="text-slate-600">All screenshots</div>}
+                </div>
+                <div className="flex justify-end gap-2">
+                  <button
+                    onClick={() => setShowSaveSearchModal(false)}
+                    className="px-4 py-2 rounded-lg text-xs font-medium text-slate-400 hover:text-slate-200 transition"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleSaveSearch}
+                    disabled={!newSearchName.trim()}
+                    className="px-4 py-2 rounded-lg text-xs font-medium bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/30 transition disabled:opacity-40"
+                  >
+                    Save
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
         
         {showSimilar ? (
           <div className="mt-6">
@@ -1931,6 +2206,31 @@ function App() {
                               }
                             }}
                           >
+                            {/* Pin Button */}
+                            <button
+                              type="button"
+                              aria-label={entry.pinned ? "Unpin screenshot" : "Pin screenshot"}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                handleTogglePin(entry.path);
+                              }}
+                              className={`absolute left-2 top-2 z-10 flex h-6 w-6 items-center justify-center rounded-full transition-all ${
+                                entry.pinned
+                                  ? "bg-amber-500/90 text-white shadow-md shadow-amber-500/20"
+                                  : "bg-[#0f1114]/90 text-slate-400 opacity-0 group-hover:opacity-100 hover:text-amber-400"
+                              }`}
+                            >
+                              <svg
+                                className="h-3 w-3"
+                                fill={entry.pinned ? "currentColor" : "none"}
+                                viewBox="0 0 24 24"
+                                stroke="currentColor"
+                                strokeWidth={2}
+                              >
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z" />
+                              </svg>
+                            </button>
+                            {/* Selection Checkbox */}
                             <button
                               type="button"
                               aria-pressed={isSelected}
@@ -1974,9 +2274,14 @@ function App() {
                               </div>
                             </div>
                             <div className="px-2.5 pb-2.5 pt-1 space-y-1.5">
-                              <p className="text-[10px] text-slate-400/80">
-                                {formatDateTime(entry.at)}
-                              </p>
+                              <div className="flex items-center justify-between">
+                                <p className="text-[10px] text-slate-400/80">
+                                  {formatDateTime(entry.at)}
+                                </p>
+                                {entry.pinned && (
+                                  <span className="text-[9px] text-amber-400">Pinned</span>
+                                )}
+                              </div>
                               {entry.tags && entry.tags.length > 0 && (
                                 <div className="flex flex-wrap gap-1">
                                   {entry.tags.slice(0, 2).map((tag, idx) => {
@@ -1999,6 +2304,19 @@ function App() {
                                       </span>
                                     );
                                   })}
+                                </div>
+                              )}
+                              {/* Custom Tags */}
+                              {entry.customTags && entry.customTags.length > 0 && (
+                                <div className="flex flex-wrap gap-1">
+                                  {entry.customTags.slice(0, 2).map((tag, idx) => (
+                                    <span
+                                      key={idx}
+                                      className="text-[9px] px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/40"
+                                    >
+                                      {tag}
+                                    </span>
+                                  ))}
                                 </div>
                               )}
                               {entry.urls && entry.urls.length > 0 && (
@@ -2039,11 +2357,19 @@ function App() {
           >
             <div className="flex items-center justify-between gap-3 pb-3">
               <div className="flex-1 min-w-0">
-                <p className="truncate text-xs text-slate-300/80">
-                  {displayPath(viewerPath)}
-                </p>
+                <div className="flex items-center gap-2">
+                  <p className="truncate text-xs text-slate-300/80">
+                    {displayPath(viewerPath)}
+                  </p>
+                  {previewEntry?.pinned && (
+                    <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40">
+                      Pinned
+                    </span>
+                  )}
+                </div>
                 {previewEntry && (
                   <div className="mt-2 flex flex-wrap items-center gap-2">
+                    {/* Auto-detected tags */}
                     {previewEntry.tags && previewEntry.tags.length > 0 && (
                       <>
                         {previewEntry.tags.map((tag, idx) => {
@@ -2068,6 +2394,27 @@ function App() {
                         })}
                       </>
                     )}
+                    {/* Custom tags with remove button */}
+                    {previewEntry.customTags && previewEntry.customTags.length > 0 && (
+                      <>
+                        {previewEntry.customTags.map((tag, idx) => (
+                          <span
+                            key={`custom-${idx}`}
+                            className="group text-[10px] px-2 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/40 flex items-center gap-1"
+                          >
+                            {tag}
+                            <button
+                              onClick={() => handleRemoveCustomTag(viewerPath, tag)}
+                              className="opacity-0 group-hover:opacity-100 text-violet-400 hover:text-rose-400 transition"
+                            >
+                              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                              </svg>
+                            </button>
+                          </span>
+                        ))}
+                      </>
+                    )}
                     {previewEntry.urls && previewEntry.urls.length > 0 && (
                       <a
                         href={previewEntry.urls[0]}
@@ -2090,8 +2437,63 @@ function App() {
                     )}
                   </div>
                 )}
+                {/* Custom Tag Input */}
+                <div className="mt-2 flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={customTagInput}
+                    onChange={(e) => setCustomTagInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && customTagInput.trim()) {
+                        handleAddCustomTag(viewerPath, customTagInput);
+                        setCustomTagInput("");
+                      }
+                    }}
+                    placeholder="Add custom tag..."
+                    className="w-40 rounded border border-slate-700/50 bg-slate-800/30 px-2 py-1 text-[10px] text-slate-200 placeholder:text-slate-500 focus:border-slate-600/50 focus:outline-none"
+                    list="custom-tags-list"
+                  />
+                  <datalist id="custom-tags-list">
+                    {allCustomTags.map(tag => (
+                      <option key={tag} value={tag} />
+                    ))}
+                  </datalist>
+                  <button
+                    onClick={() => {
+                      if (customTagInput.trim()) {
+                        handleAddCustomTag(viewerPath, customTagInput);
+                        setCustomTagInput("");
+                      }
+                    }}
+                    disabled={!customTagInput.trim()}
+                    className="px-2 py-1 rounded text-[10px] bg-violet-500/20 text-violet-300 border border-violet-500/40 hover:bg-violet-500/30 transition disabled:opacity-40"
+                  >
+                    Add
+                  </button>
+                </div>
               </div>
               <div className="flex items-center gap-2">
+                {/* Pin Button */}
+                <button
+                  type="button"
+                  onClick={() => handleTogglePin(viewerPath)}
+                  className={`rounded-lg border px-3 py-1 text-[11px] transition flex items-center gap-1.5 ${
+                    previewEntry?.pinned
+                      ? "border-amber-500/70 bg-amber-500/10 text-amber-200"
+                      : "border-slate-700/70 bg-[#0f1114] text-slate-200 hover:border-slate-500/70 hover:text-slate-100"
+                  }`}
+                >
+                  <svg
+                    className="h-3.5 w-3.5"
+                    fill={previewEntry?.pinned ? "currentColor" : "none"}
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    strokeWidth={2}
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z" />
+                  </svg>
+                  {previewEntry?.pinned ? "Pinned" : "Pin"}
+                </button>
                 <button
                   type="button"
                   onClick={copyViewerImage}
